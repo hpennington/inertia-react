@@ -1,0 +1,1727 @@
+import React from 'react'
+import {InertiaAnimationSchema, MessageTranslation, MessageActionables, MessageActionable, InertiaSchemaWrapper, InertiaAnimationInvokeType, WebSocketClient, InertiaDataModel, InertiaCanvasSize, MessageType, MessageWrapper, InertiaID, Tree, Node, ActionableIdPair, AnimationSignal, MessagePlaybackProgress, InertiaPlayback, valuesAtTime, sanitizeValues, trackDuration, InertiaShape, Vertex, shapeTriangles, shapeBounds, normalizeShape, InertiaAnimationValues as InertiaAnimationValuesBase} from 'inertia-base'
+
+export type InertiaContainerProps = {
+    children: React.ReactElement,
+    dev: boolean,
+    id: string,
+    /// The id of the container's own node in the hierarchy — the root every
+    /// actionable inside it hangs from. Usually the same string as `id`.
+    hierarchyId: string,
+    baseURL: string,
+}
+
+export type InertiaProps = {
+    children: React.ReactElement,
+    /// The id this actionable's animation is authored against. Shared by every
+    /// instance of it, and the same id `useInertia().trigger` and friends take.
+    id: string,
+}
+
+export type InertiaActionableProps = {
+    children: React.ReactElement,
+    id: string,
+}
+
+type InertiaContextType = {
+    inertiaDataModel: InertiaDataModel;
+    setInertiaDataModel: React.Dispatch<React.SetStateAction<InertiaDataModel>>;
+};
+
+const InertiaContext = React.createContext<InertiaContextType | undefined>(undefined);
+
+const useInertiaDataModel = (): InertiaContextType => {
+    const context = React.useContext(InertiaContext);
+    if (!context) {
+        throw new Error('useInertiaDataModel must be used within a InertiaContext.Provider');
+    }
+    return context;
+};
+
+const InertiaParentIdContext = React.createContext<string|undefined>(undefined)
+
+
+const useInertiaParentId = () => {
+    const inertiaParentId = React.useContext(InertiaParentIdContext)
+
+    if (!inertiaParentId) {
+        throw new Error('useInertiaParentId must be used within a InertiaContext.Provider')
+    }
+
+    return inertiaParentId
+}
+
+const InertiaContainerIdContext = React.createContext<string|undefined>(undefined)
+
+
+const useInertiaContainerId = () => {
+    const inertiaContainerId = React.useContext(InertiaContainerIdContext)
+
+    if (!inertiaContainerId) {
+        throw new Error('useInertiaContainerId must be used within a InertiaContainerIdContext.Provider')
+    }
+
+    return inertiaContainerId
+}
+
+const InertiaIsContainerContext = React.createContext<boolean>(false)
+
+
+const useInertiaIsContainer = () => {
+    const inertiaIsContainer = React.useContext(InertiaIsContainerContext)
+
+    if (!inertiaIsContainer) {
+        throw new Error('useInertiaIsContainer must be used within a InertiaIsContainerContext.Provider')
+    }
+
+    return inertiaIsContainer
+}
+
+// --- MessageSelected ---
+export type MessageSelected = {
+    selectedIds: Set<ActionableIdPair>;
+};
+
+// --- Basic Types ---
+export type CGPoint = { x: number; y: number };
+export type CGSize = { width: number; height: number };
+
+// --- Enum ---
+export enum InertiaObjectType {
+    Shape = "shape",
+    Animation = "animation",
+}
+
+/// Re-exported from `inertia-base` rather than restated here.
+///
+/// These used to be declared a second time in this package, and one of them
+/// disagreed with the original: `InertiaAnimationValues.translate` was a
+/// `CGSize` here and the `[x, y]` pair it is on the wire there. Which of the two
+/// a consumer got depended on which package they imported the name from, and the
+/// two do not assign to each other — while everything in this file that actually
+/// reads a `translate` (`renderNode`, the shape canvases) indexes it as a pair,
+/// so the local declaration described a shape nothing produced.
+export type {
+    AnimationContainer,
+    InertiaAnimationValues,
+    InertiaAnimationKeyframe,
+    MessageSchema,
+} from 'inertia-base';
+
+/// A fully collapsed transform: scaled to nothing and fully transparent. Not the
+/// identity — see `sanitizeValues` in `inertia-base` for that.
+export const zeroInertiaAnimationValues: InertiaAnimationValuesBase = {
+    scale: 0,
+    translate: [0, 0],
+    rotate: 0,
+    rotateCenter: 0,
+    opacity: 0,
+};
+
+class SharedIndexManager {
+    // The singleton instance
+    private static _instance: SharedIndexManager;
+
+    // Private constructor to prevent external instantiation
+    private constructor() {}
+
+    // Static getter to access the singleton
+    public static get shared(): SharedIndexManager {
+        if (!SharedIndexManager._instance) {
+            SharedIndexManager._instance = new SharedIndexManager();
+        }
+        return SharedIndexManager._instance;
+    }
+
+    // Properties
+    public indexMap: Record<string, number> = {};
+    public objectIndexMap: Record<string, number> = {};
+    public objectIdSet: Set<string> = new Set();
+}
+
+// ------------------ Playback ------------------
+
+type RegisteredNode = {
+    hierarchyIdPrefix: string;
+    element: HTMLElement;
+    /// A track the registered element carries itself, rather than one looked up
+    /// by prefix: what a shape authored with an animation of its own is drawn
+    /// from. The prefix is still the actionable it belongs to, which is what
+    /// says whether that actionable has been triggered.
+    schema?: InertiaAnimationSchema;
+};
+
+type ActionableState = {
+    /// Whether the app has started this actionable. The editor can pause, seek
+    /// and resume a run, but starting one is the app's call.
+    trigger: boolean;
+    isCancelled: boolean;
+};
+
+/// Owns the clock every actionable in a container is drawn from.
+///
+/// The editor's timeline and the animation on screen have to be the same thing,
+/// so nothing here hands a track to the browser's animation engine and lets it
+/// keep its own time — a run the editor cannot seek into is a run its playhead
+/// can only guess at. Instead one clock ticks per frame, and every registered
+/// element is written with the values its track reaches at the playhead.
+/// Playing, pausing and scrubbing are then all the same operation.
+export class InertiaPlaybackController {
+    private nodes = new Map<string, RegisteredNode>();
+    private schemas = new Map<string, InertiaAnimationSchema>();
+    private states = new Map<string, ActionableState>();
+    private canvasSize: InertiaCanvasSize | null = null;
+
+    /// How long one loop lasts, as set on the editor's timeline. Applies from
+    /// the next frame, so resizing the timeline mid-run stretches the loop
+    /// rather than waiting for it to be restarted.
+    public loopDuration: number = InertiaPlayback.defaultLoopDuration;
+    public playheadTime: number = 0;
+    /// Whether a run is on screen: playing, or holding the frame it finished on.
+    /// Not the same as the clock ticking — a run that has played once and
+    /// stopped still holds its final values.
+    public isRunning: boolean = false;
+    /// Whether tracks repeat once they reach the end of the loop.
+    ///
+    /// Set by the app. A repeating run wraps at `playbackDuration` and every
+    /// track is padded out to it, so actionables of different lengths restart
+    /// together; a run that plays once stops at the end and holds there.
+    public isRepeating: boolean = true;
+    /// Where the editor has parked the playhead, while it is parked there.
+    /// Non-nil means the run is being scrubbed or is paused rather than played.
+    public seekTime: number | null = null;
+    /// The `sequence` of the last signal applied, echoed back on every progress
+    /// report so the editor can tell its own request's effect from a report
+    /// still in flight from before it.
+    public lastProcessedSignalSequence: number = 0;
+
+    /// Called on every tick of the clock while running, and once more when a run
+    /// stops. The container forwards these to the editor.
+    public onProgress?: (progress: MessagePlaybackProgress) => void;
+
+    private frameHandle: number | null = null;
+    private runStartMs: number = 0;
+    private runOffset: number = 0;
+
+    /// One turn of the timeline: the loop the editor drew, or the longest track,
+    /// whichever is longer. Anything recorded past the end of the loop stretches
+    /// it, which keeps every track the same length as every other.
+    get playbackDuration(): number {
+        let longestTrack = 0;
+        this.schemas.forEach(schema => {
+            longestTrack = Math.max(longestTrack, trackDuration(schema));
+        });
+
+        return Math.max(this.loopDuration, longestTrack);
+    }
+
+    /// Translations are stored normalized, so nothing can be drawn until the
+    /// container has measured itself.
+    public setCanvasSize(size: InertiaCanvasSize | null): void {
+        this.canvasSize = size;
+        this.render();
+    }
+
+    /// Whether the editor has asked for playback and not since paused it.
+    ///
+    /// Held across schema arrivals because the two race. The editor sends the
+    /// schemas and then `resume` straight after, but a schema message only
+    /// reaches this controller through a React re-render and the effect that
+    /// follows it, while a signal is applied the moment it arrives — so `resume`
+    /// lands first, against a `states` map that is still empty, and there is
+    /// nothing for it to start. Remembering the request lets the schemas start
+    /// themselves when they turn up a tick later.
+    private isEditorPlaying: boolean = false;
+
+    /// Replaces the schemas, keyed by hierarchy id prefix.
+    ///
+    /// `auto` animations start as soon as their schema arrives — as does
+    /// everything else while the editor is playing, since authoring a `trigger`
+    /// animation is exactly when nothing is going to call `trigger()` for it.
+    /// Neither happens if the editor has parked the playhead, where starting a
+    /// run would take it away from whoever is scrubbing.
+    public setSchemas(schemas: Map<string, InertiaAnimationSchema>): void {
+        this.schemas = schemas;
+
+        /// Whether this call is what started something, as opposed to finding it
+        /// already started. Only a fresh trigger starts the clock: the schemas
+        /// are handed over again on every write to the data model — selecting a
+        /// node, flipping the editor's switch — and an actionable already marked
+        /// triggered must not be started a second time by one of those. A run
+        /// that has played once and is holding its final frame has a stopped
+        /// clock but a set `trigger`, so starting on `hasTriggeredActionable`
+        /// played it again from the top every time a node was clicked.
+        let didTrigger = false;
+
+        schemas.forEach((schema, prefix) => {
+            if (!this.states.has(prefix)) {
+                this.states.set(prefix, { trigger: false, isCancelled: false });
+            }
+
+            if (schema.invokeType === InertiaAnimationInvokeType.auto || this.isEditorPlaying) {
+                const state = this.states.get(prefix)!;
+                if (!state.isCancelled && !state.trigger) {
+                    state.trigger = true;
+                    didTrigger = true;
+                }
+            }
+        });
+
+        this.render();
+
+        if (this.seekTime === null && didTrigger) {
+            this.startClock();
+        }
+    }
+
+    public registerNode(hierarchyId: string, hierarchyIdPrefix: string, element: HTMLElement): void {
+        this.nodes.set(hierarchyId, { hierarchyIdPrefix, element });
+        this.renderNode(hierarchyId);
+    }
+
+    /// Registers something drawn behind an actionable that moves on a track of
+    /// its own — a shape authored with an animation attached.
+    ///
+    /// Drawn from the same clock as everything else, so a shape moves in time
+    /// with the actionable it was authored behind rather than on a clock of its
+    /// own. It is `hierarchyIdPrefix` that ties it to that actionable, and
+    /// `schema` alone that says how it moves.
+    public registerShapeNode(
+        id: string,
+        hierarchyIdPrefix: string,
+        element: HTMLElement,
+        schema: InertiaAnimationSchema
+    ): void {
+        this.nodes.set(id, { hierarchyIdPrefix, element, schema });
+        this.renderNode(id);
+    }
+
+    public unregisterNode(hierarchyId: string): void {
+        const node = this.nodes.get(hierarchyId);
+        if (node) {
+            node.element.style.transform = "";
+            node.element.style.opacity = "";
+        }
+        this.nodes.delete(hierarchyId);
+    }
+
+    private get hasTriggeredActionable(): boolean {
+        let triggered = false;
+        this.states.forEach(state => {
+            triggered = triggered || (state.trigger && !state.isCancelled);
+        });
+        return triggered;
+    }
+
+    // MARK: - App-facing controls
+
+    /// Starts an animation that was waiting on its `trigger` invoke type.
+    ///
+    /// A trigger arriving while the animation is already running joins the run
+    /// in progress rather than cutting it short — `restart()` is the one that
+    /// starts over. Cancelled animations are left where they are: stopping one
+    /// is the app's call, and picking it back up is `restart()`'s.
+    public trigger(id: string): void {
+        const state = this.states.get(id);
+        if (state?.isCancelled === true || state?.trigger === true) {
+            return;
+        }
+
+        this.start(id);
+    }
+
+    /// Stops an animation and returns it to its initial values, where it stays
+    /// until `restart()`.
+    ///
+    /// The clock stops with the last animation running off it, since a playhead
+    /// with nothing left to follow is one the editor should see parked. The
+    /// cancellation is recorded whether or not this animation has a state entry
+    /// yet, so cancelling before its schema lands still sticks.
+    public cancel(id: string): void {
+        this.states.set(id, { trigger: false, isCancelled: true });
+        this.render();
+
+        if (this.hasTriggeredActionable) {
+            return;
+        }
+
+        this.stopClock();
+        this.report(false);
+    }
+
+    /// Clears a cancellation and plays from the top of the timeline.
+    ///
+    /// Every actionable in a container is drawn from the one clock, so this
+    /// rewinds the playhead for all of them rather than for this animation alone
+    /// — the same shared clock that makes a trigger mid-run join the run in
+    /// progress instead of restarting it.
+    public restart(id: string): void {
+        this.stopClock();
+        this.playheadTime = 0;
+
+        this.start(id);
+    }
+
+    public isCancelled(id: string): boolean {
+        return this.states.get(id)?.isCancelled ?? false;
+    }
+
+    private start(id: string): void {
+        this.states.set(id, { trigger: true, isCancelled: false });
+        this.seekTime = null;
+        this.startClock();
+    }
+
+    // MARK: - Editor signals
+
+    public applySignal(signal: AnimationSignal, sequence: number): void {
+        this.lastProcessedSignalSequence = sequence;
+
+        switch (signal.type) {
+            case "pause":
+                this.pausePlayback();
+                break;
+            case "resume":
+                this.resumePlayback();
+                break;
+            case "seek":
+                this.seek(signal.time);
+                break;
+            case "setLoopDuration":
+                this.loopDuration = InertiaPlayback.clampLoopDuration(signal.duration);
+                this.render();
+                break;
+        }
+    }
+
+    /// Stops the run and reports where it stopped, so a paused playhead sits
+    /// exactly where the animation froze.
+    private pausePlayback(): void {
+        this.isEditorPlaying = false;
+        this.stopClock();
+        this.seekTime = this.playheadTime;
+        this.render();
+        this.report(false);
+    }
+
+    /// The editor's play button: runs every animation, whatever its
+    /// `invokeType`, picking a paused or scrubbed run back up where it was left.
+    ///
+    /// `auto` animations are already going by the time this arrives — those
+    /// start as soon as their schema does. A `trigger` animation is waiting on
+    /// the app to call `trigger()`, which is not something the app does while
+    /// its animation is being authored, so the editor stands in for the app and
+    /// starts it here. Signals only ever come from the editor, so the same
+    /// animation running without the editor attached still waits for its
+    /// trigger.
+    ///
+    /// Cancelled animations are left where they are: stopping one is the app's
+    /// call, and picking it back up is `restart()`'s.
+    private resumePlayback(): void {
+        this.isEditorPlaying = true;
+        // Unparked before the bail-out below, not after: a play following a
+        // pause has to release the playhead even when the schemas it applies to
+        // have not arrived yet, or `setSchemas` finds it still parked and
+        // declines to start the run.
+        this.seekTime = null;
+
+        this.states.forEach(state => {
+            if (!state.isCancelled) {
+                state.trigger = true;
+            }
+        });
+
+        // Nothing to play yet: the schemas this request arrived ahead of will
+        // start themselves in `setSchemas`, which is where the race above is
+        // settled.
+        if (!this.hasTriggeredActionable) {
+            return;
+        }
+
+        this.startClock();
+    }
+
+    /// Freezes the animation at `time`. The editor is the one moving the
+    /// playhead here, so this does not report back: the position it would send
+    /// is the one it just asked for.
+    private seek(time: number): void {
+        this.stopClock();
+
+        const clamped = Math.min(Math.max(time, 0), this.playbackDuration);
+        this.seekTime = clamped;
+        this.playheadTime = clamped;
+        this.render();
+    }
+
+    // MARK: - The clock
+
+    /// Times the run that just started.
+    ///
+    /// Actionables trigger one at a time, so a trigger arriving while the clock
+    /// is already running joins the run in progress rather than restarting it.
+    /// Playing picks up from wherever the playhead was left — scrubbed to, or
+    /// paused at — rather than from the top; only a playhead parked at the very
+    /// end of the loop starts over, since there is nothing left to play.
+    private startClock(): void {
+        if (this.frameHandle !== null) {
+            return;
+        }
+
+        // Nothing loaded yet: there is no animation for the playhead to follow.
+        if (this.schemas.size === 0) {
+            return;
+        }
+
+        const duration = this.playbackDuration;
+        this.runOffset = this.playheadTime < duration ? this.playheadTime : 0;
+        this.playheadTime = this.runOffset;
+        this.isRunning = true;
+        this.runStartMs = performance.now();
+
+        this.render();
+        this.report(true);
+
+        this.frameHandle = requestAnimationFrame(this.tick);
+    }
+
+    private stopClock(): void {
+        if (this.frameHandle !== null) {
+            cancelAnimationFrame(this.frameHandle);
+            this.frameHandle = null;
+        }
+        this.isRunning = false;
+    }
+
+    private tick = (now: number): void => {
+        this.frameHandle = null;
+
+        if (!this.isRunning) {
+            return;
+        }
+
+        // Read each frame: the timeline can be resized mid-run.
+        const duration = this.playbackDuration;
+        const elapsed = this.runOffset + (now - this.runStartMs) / 1000;
+
+        // A run that plays once ends here, holding its final frame: no further
+        // frame is requested, but `isRunning` stays set so the run stays on
+        // screen. Starting it again is the app's call.
+        if (!this.isRepeating && elapsed >= duration) {
+            this.playheadTime = duration;
+            this.render();
+            this.report(false);
+            return;
+        }
+
+        this.playheadTime = duration > 0 ? elapsed % duration : 0;
+        this.render();
+        this.report(true);
+
+        this.frameHandle = requestAnimationFrame(this.tick);
+    };
+
+    private report(isRunning: boolean): void {
+        this.onProgress?.({
+            time: this.playheadTime,
+            duration: this.playbackDuration,
+            isRunning,
+            lastProcessedSequence: this.lastProcessedSignalSequence,
+        });
+    }
+
+    /// Tears the clock down. Called when the container unmounts, so a stray
+    /// frame callback cannot keep writing to detached elements.
+    public dispose(): void {
+        this.stopClock();
+        this.onProgress = undefined;
+        this.nodes.clear();
+    }
+
+    // MARK: - Drawing
+
+    /// Redraws every registered node at the current playhead. Public so a
+    /// setting changed while the clock is stopped still reaches the screen.
+    public render(): void {
+        this.nodes.forEach((_, hierarchyId) => this.renderNode(hierarchyId));
+    }
+
+    private renderNode(hierarchyId: string): void {
+        const node = this.nodes.get(hierarchyId);
+        if (!node || !this.canvasSize) {
+            return;
+        }
+
+        const schema = node.schema ?? this.schemas.get(node.hierarchyIdPrefix);
+        if (!schema) {
+            node.element.style.transform = "";
+            node.element.style.opacity = "";
+            return;
+        }
+
+        const state = this.states.get(node.hierarchyIdPrefix);
+        const isTriggered = !!state?.trigger && !state.isCancelled;
+        // A shape's own track does not share its actionable's `invokeType`: one
+        // marked `auto` runs as soon as the clock does, even while the
+        // actionable it backs is still waiting on the app to trigger it. A shape
+        // given a `trigger` animation waits for that actionable, which is the
+        // only trigger a shape can be reached by.
+        const isPlayable = isTriggered
+            || (!!node.schema && node.schema.invokeType === InertiaAnimationInvokeType.auto);
+        // Scrubbing shows the animation without running it, which is why a
+        // parked playhead draws the same way a running one does.
+        const isShowingTrack = isPlayable && (this.isRunning || this.seekTime !== null);
+
+        const values = isShowingTrack
+            ? valuesAtTime(schema, this.playheadTime, this.playbackDuration, this.isRepeating)
+            : sanitizeValues(schema.initialValues);
+
+        // Written outermost-first, which is the order the SwiftUI runtime stacks
+        // its modifiers in — offset, then rotateCenter, then rotate, then scale —
+        // so the same schema composes the same matrix on both.
+        //
+        // `rotate` pivots on the top left corner while every other function here
+        // pivots on the center, and an element has one transform-origin. Wrapping
+        // it in a half-box translation and its inverse walks the pivot out to the
+        // corner and back, which is what SwiftUI's `anchor: .topLeading` does. The
+        // percentages resolve against this element's own border box, so the pair
+        // cancels exactly and a `rotate` of 0 leaves the matrix untouched.
+        node.element.style.transform = [
+            `translateX(${values.translate[0] * this.canvasSize.width}px)`,
+            `translateY(${values.translate[1] * this.canvasSize.height}px)`,
+            `rotate(${values.rotateCenter}deg)`,
+            `translate(-50%, -50%)`,
+            `rotate(${values.rotate}deg)`,
+            `translate(50%, 50%)`,
+            `scale(${values.scale})`,
+        ].join(" ");
+        node.element.style.transformOrigin = "center";
+        node.element.style.opacity = `${values.opacity}`;
+    }
+}
+
+const InertiaPlaybackContext = React.createContext<InertiaPlaybackController | null>(null);
+
+/// The app's handle on playback: start an animation the schema left waiting,
+/// stop one, or start it over.
+///
+/// The same surface the SwiftUI runtime reaches through
+/// `@Environment(\.inertiaDataModel)` and the Compose runtime through
+/// `LocalInertia.current` — `isRepeating` and `loopDuration` are properties
+/// rather than setter functions so an app reads the same on all three.
+export type InertiaPlaybackHandle = {
+    trigger(id: string): void;
+    cancel(id: string): void;
+    restart(id: string): void;
+    isCancelled(id: string): boolean;
+    /// Whether tracks repeat once they reach the end of the loop. On by
+    /// default; turn it off for animations that play once.
+    isRepeating: boolean;
+    /// How long one loop lasts, as set on the editor's timeline. Applies from
+    /// the next frame, so resizing it mid-run stretches the loop rather than
+    /// waiting for the run to be restarted.
+    loopDuration: number;
+    /// How far into the run currently on screen we are, in seconds.
+    readonly playheadTime: number;
+    /// Where the editor has parked the playhead, while it is parked there.
+    /// Non-null means the run is being scrubbed or paused rather than played.
+    readonly seekTime: number | null;
+};
+
+export const useInertia = (): InertiaPlaybackHandle => {
+    const controller = React.useContext(InertiaPlaybackContext);
+
+    if (!controller) {
+        throw new Error('useInertia must be used within an InertiaContainer');
+    }
+
+    // Accessors rather than a snapshot: the controller drives the screen
+    // imperatively, so a value copied out here would be stale by the next frame.
+    return React.useMemo(() => ({
+        trigger: (id: string) => controller.trigger(id),
+        cancel: (id: string) => controller.cancel(id),
+        restart: (id: string) => controller.restart(id),
+        isCancelled: (id: string) => controller.isCancelled(id),
+        get isRepeating() { return controller.isRepeating; },
+        set isRepeating(value: boolean) {
+            controller.isRepeating = value;
+            // Redraws, so toggling this while paused takes effect on screen
+            // rather than waiting for the next tick that isn't coming.
+            controller.render();
+        },
+        get loopDuration() { return controller.loopDuration; },
+        set loopDuration(value: number) {
+            controller.loopDuration = value;
+            controller.render();
+        },
+        get playheadTime() { return controller.playheadTime; },
+        get seekTime() { return controller.seekTime; },
+    }), [controller]);
+};
+
+function handleMessageSchema(
+    schemaWrappers: InertiaSchemaWrapper[],
+    inertiaDataModel: InertiaDataModel | null,
+    setInertiaDataModel: React.Dispatch<React.SetStateAction<InertiaDataModel>>
+): void {
+    console.log(`[INERTIA_LOG]: [handleMessageSchema] Received ${schemaWrappers.length} schema wrappers`);
+
+    if (!inertiaDataModel) {
+        console.log(`[INERTIA_LOG]: [handleMessageSchema] ❌ No inertiaDataModel!`);
+        return;
+    }
+
+    for (const schemaWrapper of schemaWrappers) {
+        console.log(
+            `[INERTIA_LOG]: [handleMessageSchema] wrapper - containerId: ${schemaWrapper.container.containerId}, actionableId: ${schemaWrapper.actionableId}, animationId: ${schemaWrapper.animationId}`
+        );
+        console.log(`[INERTIA_LOG]: [handleMessageSchema] schema:`, schemaWrapper.schema);
+        console.log(`[INERTIA_LOG]: [handleMessageSchema] my containerId: ${inertiaDataModel.containerId}`);
+
+        if (schemaWrapper.container.containerId === inertiaDataModel.containerId) {
+            setInertiaDataModel(prev => {
+                const updated = { ...prev };
+
+                // Store the mapping from actionable ID to animation ID
+                updated.actionableIdToAnimationIdMap = new Map(prev.actionableIdToAnimationIdMap);
+                updated.actionableIdToAnimationIdMap.set(schemaWrapper.actionableId, schemaWrapper.animationId);
+                // Store the schema by its animation ID
+                updated.inertiaSchemas = new Map(prev.inertiaSchemas);
+                updated.inertiaSchemas.set(schemaWrapper.animationId, schemaWrapper.schema);
+
+                console.log(
+                    `[INERTIA_LOG]: ✅ stored schema - animationId: ${schemaWrapper.animationId} actionableId: ${schemaWrapper.actionableId}, keyframes: ${schemaWrapper.schema.keyframes?.length ?? 0}`
+                );
+                console.log(`[INERTIA_LOG]: actionableIdToAnimationIdMap:`, Object.fromEntries(updated.actionableIdToAnimationIdMap));
+                console.log(`[INERTIA_LOG]: inertiaSchemas keys:`, Array.from(updated.inertiaSchemas.keys()));
+
+                return updated;
+            });
+        } else {
+            console.log(`[INERTIA_LOG]: ❌ skipped - container mismatch (wanted: ${schemaWrapper.container.containerId}, have: ${inertiaDataModel.containerId})`);
+        }
+    }
+}
+
+// ------------------ Alignment grid ------------------
+
+/// Where the node being dragged sits in the container's coordinate space. An
+/// absolute position rather than a translation: guides are drawn from it, and a
+/// node need not be laid out at the container's center.
+export type InertiaGuides = {
+  center: { x: number; y: number };
+  size: { width: number; height: number };
+};
+
+/// The alignment overlay's state, held per container and written by the
+/// actionable being dragged.
+///
+/// Kept out of `InertiaDataModel` on purpose: that model is replaced on every
+/// write, and the container resets each actionable's drag position whenever it
+/// changes — so routing a drag through it would snap the node back to the origin
+/// on every pointer move. Only the overlay subscribes here, so a drag repaints
+/// the guides and leaves the rest of the tree alone.
+export class InertiaGuideStore {
+  private guides: InertiaGuides | null = null;
+  private listeners = new Set<() => void>();
+
+  subscribe = (listener: () => void): (() => void) => {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  };
+
+  getSnapshot = (): InertiaGuides | null => this.guides;
+
+  show(center: { x: number; y: number }, size: { width: number; height: number }): void {
+    this.guides = { center, size };
+    this.emit();
+  }
+
+  hide(): void {
+    if (!this.guides) return;
+    this.guides = null;
+    this.emit();
+  }
+
+  private emit(): void {
+    this.listeners.forEach(listener => listener());
+  }
+}
+
+const InertiaGuidesContext = React.createContext<InertiaGuideStore | null>(null);
+
+const GUIDE_COLOR = "cyan";
+const CROSSHAIR_COLOR = "red";
+
+/// Dashed guides tracking the dragged node's edges and center within the
+/// container, over a crosshair through the container's own center.
+///
+/// Laid out in percentages so it needs no size of its own: the container is the
+/// SVG's viewport, and the guide offsets are already in its coordinate space.
+const InertiaAlignmentGrid: React.FC<{ store: InertiaGuideStore }> = ({ store }) => {
+  const guides = React.useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
+  if (!guides) return null;
+
+  const { center, size } = guides;
+  // A node measured before its first layout, or mid-teardown, has nothing to
+  // draw guides against.
+  if (!(size.width > 0) || !(size.height > 0)) return null;
+  if (!Number.isFinite(center.x) || !Number.isFinite(center.y)) return null;
+
+  const xs = [center.x - size.width / 2, center.x, center.x + size.width / 2];
+  const ys = [center.y - size.height / 2, center.y, center.y + size.height / 2];
+  const guideProps = (isCenter: boolean) => ({
+    stroke: GUIDE_COLOR,
+    strokeWidth: 1,
+    strokeOpacity: isCenter ? 1 : 0.5,
+    strokeDasharray: isCenter ? undefined : "4 4",
+  });
+
+  return (
+    <svg
+      style={{
+        position: "absolute",
+        top: 0,
+        left: 0,
+        width: "100%",
+        height: "100%",
+        pointerEvents: "none",
+        overflow: "visible",
+      }}
+    >
+      <line x1="50%" y1="0" x2="50%" y2="100%" stroke={CROSSHAIR_COLOR} strokeWidth={1} />
+      <line x1="0" y1="50%" x2="100%" y2="50%" stroke={CROSSHAIR_COLOR} strokeWidth={1} />
+
+      {xs.map((x, index) => (
+        <line key={`x-${index}`} x1={x} y1="0" x2={x} y2="100%" {...guideProps(index === 1)} />
+      ))}
+      {ys.map((y, index) => (
+        <line key={`y-${index}`} x1="0" y1={y} x2="100%" y2={y} {...guideProps(index === 1)} />
+      ))}
+
+      <rect
+        x={center.x - size.width / 2}
+        y={center.y - size.height / 2}
+        width={size.width}
+        height={size.height}
+        fill="none"
+        stroke={GUIDE_COLOR}
+        strokeWidth={1}
+        strokeDasharray="4 4"
+      />
+    </svg>
+  );
+};
+
+export const InertiaContainer = ({ children, dev, id, hierarchyId, baseURL }: InertiaContainerProps): React.ReactElement => {
+    const [inertiaDataModel, setInertiaDataModel] = React.useState(
+        new InertiaDataModel(id, new Map(), new Tree(id), new Set())
+    );
+    const [bounds, setBounds] = React.useState<InertiaCanvasSize | null>(null);
+    const ref = React.useRef<HTMLDivElement | null>(null);
+    const controllerRef = React.useRef<InertiaPlaybackController | null>(null);
+    if (controllerRef.current === null) {
+        controllerRef.current = new InertiaPlaybackController();
+    }
+    const controller = controllerRef.current;
+
+    const guidesRef = React.useRef<InertiaGuideStore | null>(null);
+    if (guidesRef.current === null) {
+        guidesRef.current = new InertiaGuideStore();
+    }
+    const guides = guidesRef.current;
+
+    // Load animation schemas from JSON file if not in dev mode
+    React.useEffect(() => {
+        console.log(`[INERTIA_LOG]: InertiaContainer init - dev: ${dev}, id: ${id}, baseURL: ${baseURL}`);
+
+        if (dev) {
+            console.log(`[INERTIA_LOG]: Dev mode enabled - schemas will be loaded via WebSocket`);
+            return;
+        }
+
+        console.log(`[INERTIA_LOG]: Production mode - attempting to load ${baseURL}/${id}.json`);
+
+        const loadAnimations = async () => {
+            try {
+                const url = `${baseURL}/${id}.json`;
+                console.log(`[INERTIA_LOG]: Fetching ${url}`);
+                const response = await fetch(url);
+
+                if (!response.ok) {
+                    console.error(`[INERTIA_LOG]: Failed to load animation file: ${url} (status: ${response.status})`);
+                    return;
+                }
+
+                const schemas: InertiaAnimationSchema[] = await response.json();
+                console.log(`[INERTIA_LOG]: Loaded ${schemas.length} schemas from ${id}.json`, schemas);
+
+                const schemaMap = new Map<string, InertiaAnimationSchema>();
+                const actionableIdToAnimationIdMap = new Map<string, string>();
+
+                for (const schema of schemas) {
+                    // Store schema by its ID (hierarchyIdPrefix)
+                    schemaMap.set(schema.id, schema);
+                    // Map hierarchyIdPrefix to animationId
+                    actionableIdToAnimationIdMap.set(schema.id, schema.id);
+                    console.log(`[INERTIA_LOG]: Loaded schema - id: ${schema.id}, keyframes: ${schema.keyframes?.length ?? 0}`);
+                }
+
+                console.log(`[INERTIA_LOG]: Setting inertiaDataModel with ${schemaMap.size} schemas`);
+                setInertiaDataModel(prev => ({
+                    ...prev,
+                    inertiaSchemas: schemaMap,
+                    actionableIdToAnimationIdMap
+                }));
+            } catch (error) {
+                console.error(`[INERTIA_LOG]: Error loading animation file ${id}.json:`, error);
+            }
+        };
+
+        loadAnimations();
+    }, [dev, baseURL, id]);
+
+    React.useEffect(() => {
+        if (!ref.current) return;
+
+        const observer = new ResizeObserver((entries) => {
+            const element = ref.current;
+            if (!element) return;
+
+            // The border box, not `entry.contentRect` — that is the *content*
+            // box, so a container the host had put padding or a border on
+            // measured smaller here than the same container does under
+            // SwiftUI's `GeometryReader` or Compose's `onSizeChanged`, and one
+            // authored `translate` moved the element a different distance on
+            // each. `offsetWidth`/`offsetHeight` are the same box, and are what
+            // `layoutSizeOf` already measures actionables with.
+            const box = entries[0]?.borderBoxSize?.[0];
+            setBounds({
+                width: box ? box.inlineSize : element.offsetWidth,
+                height: box ? box.blockSize : element.offsetHeight,
+            });
+        });
+
+        observer.observe(ref.current);
+
+        return () => {
+            observer.disconnect();
+        };
+    }, []); // only run once
+
+    // The canvas the normalized translations are resolved against.
+    React.useEffect(() => {
+        controller.setCanvasSize(bounds);
+    }, [controller, bounds]);
+
+    // Hand the playback controller the tracks it draws, resolved from the
+    // actionable ids the app registered to the schemas the editor sent.
+    //
+    // Keyed on the two maps rather than on the model holding them: the model is
+    // replaced wholesale on every write, so selecting a node or flipping the
+    // editor's switch would hand the controller the same tracks again — and
+    // handing over tracks is what starts an animation.
+    React.useEffect(() => {
+        const schemasByPrefix = new Map<string, InertiaAnimationSchema>();
+
+        inertiaDataModel.actionableIdToAnimationIdMap.forEach((animationId, prefix) => {
+            const schema = inertiaDataModel.inertiaSchemas.get(animationId);
+            if (schema) {
+                schemasByPrefix.set(prefix, schema);
+            }
+        });
+
+        controller.setSchemas(schemasByPrefix);
+    }, [controller, inertiaDataModel.actionableIdToAnimationIdMap, inertiaDataModel.inertiaSchemas]);
+
+    React.useEffect(() => {
+        return () => controller.dispose();
+    }, [controller]);
+
+    // ✅ WebSocket logic stays the same
+    React.useEffect(() => {
+        if (!dev) {
+            console.log(`[INERTIA_LOG]: Not in dev mode, skipping WebSocket connection`);
+            return;
+        }
+
+        const ws = WebSocketClient.shared;
+        if (!inertiaDataModel?.tree) {
+            console.log(`[INERTIA_LOG]: No tree in inertiaDataModel, skipping WebSocket connection`);
+            return;
+        }
+
+        // Where the editor's playhead comes from. Set before connecting: a run
+        // can be under way before the socket is up, and reports are dropped
+        // rather than queued while it is not.
+        controller.onProgress = (progress) => {
+            ws.sendMessagePlaybackProgress(progress);
+        };
+
+        console.log(`[INERTIA_LOG]: Connecting to WebSocket ws://127.0.0.1:8080`);
+        ws.connect("ws://127.0.0.1:8080", () => {
+            console.log(`[INERTIA_LOG]: WebSocket connected, setting up handlers`);
+
+            ws.messageReceived = (msg) => {
+              console.log(`[INERTIA_LOG]: Received messageReceived with ${msg.size} IDs`);
+
+              setInertiaDataModel(prev => {
+                const newPairs = new Set<ActionableIdPair>();
+
+                // Each msg item is a hierarchyId
+                for (const pair of msg) {
+                  // Try to find prefix (optional: infer from tree or split)
+                  newPairs.add({ hierarchyIdPrefix: pair.hierarchyIdPrefix, hierarchyId: pair.hierarchyId });
+                }
+
+                console.log("[INERTIA_LOG]: ✅ Updating actionableIdPairs from WS:", Array.from(newPairs));
+
+                return { ...prev, actionableIdPairs: newPairs };
+              });
+            };
+
+
+            ws.messageReceivedSchema = (msg) => {
+                console.log(`[INERTIA_LOG]: Received messageReceivedSchema`);
+                handleMessageSchema(msg, inertiaDataModel, setInertiaDataModel)
+            };
+
+            ws.messageReceivedIsActionable = (msg) => {
+                console.log(`[INERTIA_LOG]: Received messageReceivedIsActionable: ${msg}`);
+                setInertiaDataModel(prev => ({ ...prev, isActionable: msg }));
+            };
+
+            ws.messageReceivedSignal = (signal, sequence) => {
+                controller.applySignal(signal, sequence);
+            };
+
+            console.log(`[INERTIA_LOG]: Sending initial MessageActionables`);
+            ws.sendMessageActionables({
+                tree: inertiaDataModel.tree,
+                actionableIds: Array.from(inertiaDataModel.actionableIdPairs),
+            });
+        });
+    }, [inertiaDataModel?.tree, dev, controller]);
+
+    return (
+        <InertiaCanvasSizeContext.Provider value={bounds}>
+            {/* The frame the guides are measured against, and the one the overlay
+                is positioned in, so a position taken in an actionable and a point
+                drawn in the SVG share an origin.
+
+                It is also the frame every animation is measured against: a
+                `translate` of 1 crosses the whole container, so what the
+                container *is* has to mean the same thing on every runtime or one
+                authored animation moves a different distance on each. Filled,
+                the way SwiftUI's `GeometryReader` reports the space offered and
+                Compose's container takes it — a plain block div was as wide as
+                its parent but only as tall as its content, which made a vertical
+                `translate` resolve against a rectangle no other runtime had.
+
+                `height: 100%` needs the host to have given whatever holds this a
+                height of its own; without one it resolves to `auto` and the
+                container falls back to hugging its content, which is where it
+                started. That is the host's call to make, not something the
+                runtime can force from in here. */}
+            <div
+                data-inertia-container-id={id}
+                ref={ref}
+                style={{ position: "relative", width: "100%", height: "100%" }}
+            >
+                <InertiaContainerElementContext.Provider value={ref}>
+                    <InertiaPlaybackContext.Provider value={controller}>
+                        <InertiaGuidesContext.Provider value={guides}>
+                            <InertiaContext.Provider value={{ inertiaDataModel, setInertiaDataModel }}>
+                                <InertiaParentIdContext.Provider value={hierarchyId}>
+                                    <InertiaContainerIdContext.Provider value={hierarchyId}>
+                                        <InertiaIsContainerContext.Provider value={true}>
+                                            {children}
+                                        </InertiaIsContainerContext.Provider>
+                                    </InertiaContainerIdContext.Provider>
+                                </InertiaParentIdContext.Provider>
+                            </InertiaContext.Provider>
+                        </InertiaGuidesContext.Provider>
+                    </InertiaPlaybackContext.Provider>
+                </InertiaContainerElementContext.Provider>
+                <InertiaAlignmentGrid store={guides} />
+            </div>
+        </InertiaCanvasSizeContext.Provider>
+    );
+};
+
+
+import { useState, useRef, useMemo, useCallback, useContext, useEffect } from "react";
+
+const InertiaCanvasSizeContext = React.createContext<InertiaCanvasSize | null>(null)
+const InertiaContainerElementContext = React.createContext<React.RefObject<HTMLDivElement> | null>(null)
+const manager = WebSocketClient.shared
+
+// ------------------ Draggable Props ------------------
+export interface DraggableProps {
+  hierarchyId?: string;
+  hierarchyIdPrefix?: string;
+  isSelected: boolean;
+  actionableIdPairs?: Set<ActionableIdPair>;
+  containerRef: React.RefObject<HTMLDivElement>;
+  children: React.ReactNode;
+  handleClick: () => void;
+  inertiaDataModel?: InertiaDataModel;
+  pos: { x: number; y: number };
+  setPos: React.Dispatch<React.SetStateAction<{ x: number; y: number }>>;
+  moved?: React.MutableRefObject<boolean>;
+}
+
+// ------------------ HOC ------------------
+export interface DraggableInjectedProps {
+  pos: { x: number; y: number };
+  setPos: React.Dispatch<React.SetStateAction<{ x: number; y: number }>>;
+  moved: React.MutableRefObject<boolean>;
+}
+
+export function withDrag<T extends DraggableProps>(
+  WrappedComponent: React.ComponentType<T & Partial<DraggableInjectedProps>>
+) {
+  return function Draggable(props: T & { pos: { x: number; y: number }; setPos: React.Dispatch<React.SetStateAction<{ x: number; y: number }>> }) {
+    const { isSelected, actionableIdPairs, pos, setPos, containerRef, handleClick, inertiaDataModel } = props;
+
+    /// Selection alone is not enough. Turning the editor's switch off leaves
+    /// `actionableIdPairs` as it was — the editor keeps the selection so it can
+    /// be restored — so nodes selected beforehand stay `isSelected` and would
+    /// go on dragging against an editor that has stopped taking edits. Same
+    /// pair of conditions the Swift and Compose runtimes gate their gestures on.
+    const canDrag = isSelected && (inertiaDataModel?.isActionable ?? false);
+
+    const dragging = useRef(false);
+    const moved = useRef(false);
+    const offset = useRef({ x: 0, y: 0 });
+
+    const inertiaCanvasSize = useContext(InertiaCanvasSizeContext);
+    const inertiaContainerRef = useContext(InertiaContainerElementContext);
+    const guides = useContext(InertiaGuidesContext);
+
+    /// This node's laid-out center in the container's coordinate space with the
+    /// drag transform backed out, and the size the guides box in.
+    const baseCenter = useRef({ x: 0, y: 0 });
+    const nodeSize = useRef({ width: 0, height: 0 });
+
+    /// Taken once, at the start of a gesture, rather than on every move:
+    /// `getBoundingClientRect` reports the transform the browser has painted,
+    /// which trails `pos` by a frame, so guides read live would lag the node they
+    /// are supposed to be tracking.
+    const measure = (currentPos: { x: number; y: number }) => {
+      const element = containerRef.current;
+      const container = inertiaContainerRef?.current;
+      if (!element || !container) return;
+
+      const elementRect = element.getBoundingClientRect();
+      const containerRect = container.getBoundingClientRect();
+
+      nodeSize.current = { width: elementRect.width, height: elementRect.height };
+      baseCenter.current = {
+        x: elementRect.left - containerRect.left + elementRect.width / 2 - currentPos.x,
+        y: elementRect.top - containerRect.top + elementRect.height / 2 - currentPos.y,
+      };
+    };
+
+    const startDrag = (clientX: number, clientY: number) => {
+      if (!canDrag) return;
+      dragging.current = true;
+      moved.current = false;
+      offset.current = { x: clientX - pos.x, y: clientY - pos.y };
+      measure(pos);
+    };
+
+    /// How far the node being dragged has moved from where layout put it, for
+    /// the editor's inspector.
+    ///
+    /// The accumulated drag, which is what `pos` already is — the same quantity
+    /// `stopDrag` normalizes into the translation, and what the SwiftUI runtime
+    /// sends as `totalOffset` and the Compose runtime as `dragOffset`. This used
+    /// to send the node's absolute top-left in the container's space instead, so
+    /// the one inspector readout meant two different things depending on which
+    /// runtime the app being authored was built on.
+    ///
+    /// Takes the position rather than reading `pos`: this is called from the
+    /// move handler, where the `setPos` for this event has not been applied yet,
+    /// so the state in scope is one event stale. The size comes from the
+    /// measurement taken when the gesture started, for the reason on `measure` —
+    /// `getBoundingClientRect` reports the transform the browser has painted,
+    /// which trails the drag by a frame.
+    const reportNodeProperties = (position: { x: number; y: number }) => {
+      manager.sendMessageSelectedNodeProperties({
+        positionX: position.x,
+        positionY: position.y,
+        sizeX: nodeSize.current.width,
+        sizeY: nodeSize.current.height,
+      });
+    };
+
+    const doDrag = (clientX: number, clientY: number) => {
+      if (!dragging.current) return;
+      const dx = clientX - offset.current.x - pos.x;
+      const dy = clientY - offset.current.y - pos.y;
+      if (Math.abs(dx) > 2 || Math.abs(dy) > 2) moved.current = true;
+      const next = { x: clientX - offset.current.x, y: clientY - offset.current.y };
+      setPos(next);
+      reportNodeProperties(next);
+      guides?.show(
+        { x: baseCenter.current.x + next.x, y: baseCenter.current.y + next.y },
+        nodeSize.current
+      );
+    };
+
+    const stopDrag = () => {
+      if (dragging.current && actionableIdPairs && inertiaCanvasSize) {
+        manager.sendMessageTranslation({
+          actionableIds: Array.from(actionableIdPairs),
+          translationX: pos.x / inertiaCanvasSize.width,
+          translationY: pos.y / inertiaCanvasSize.height,
+        });
+      }
+      dragging.current = false;
+      guides?.hide();
+    };
+
+    /// The switch is the editor's to flip and can go off mid-gesture, which the
+    /// pointer capture would otherwise ride straight through. The drag is
+    /// dropped rather than committed — the editor has stopped taking edits — and
+    /// the node goes back to the position its schema puts it at, since the
+    /// translation it was being dragged towards is never going to be sent.
+    useEffect(() => {
+      if (canDrag || !dragging.current) return;
+      dragging.current = false;
+      moved.current = false;
+      guides?.hide();
+      setPos({ x: 0, y: 0 });
+    }, [canDrag]);
+
+    const handleClickCapture = (e: React.MouseEvent) => {
+      if (moved.current) {
+        e.stopPropagation();
+        e.preventDefault();
+      }
+    };
+
+    /// The click that ends a gesture is dispatched at whichever element held the
+    /// pointer capture, not at the element under the cursor — so while a node is
+    /// selected the click never reaches its content, which is exactly when
+    /// unselecting has to work. The selection toggle lives here, on the element
+    /// that takes the capture.
+    const handleClickToSelect = () => {
+      if (!moved.current) handleClick();
+    };
+
+    const transformStyle = `translate(${pos.x}px, ${pos.y}px)`;
+
+    return (
+      <div
+        onPointerDown={(e) => {
+          e.stopPropagation();
+          if (canDrag) {
+            (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+            startDrag(e.clientX, e.clientY);
+          }
+        }}
+        onPointerMove={(e) => {
+          e.stopPropagation();
+          doDrag(e.clientX, e.clientY);
+        }}
+        onPointerUp={(e) => {
+          e.stopPropagation();
+          stopDrag();
+        }}
+        // A gesture the browser takes away — a cancelled touch, a lost capture —
+        // never reaches `onPointerUp`, and the grid would be left on screen.
+        onPointerCancel={(e) => {
+          e.stopPropagation();
+          stopDrag();
+        }}
+        onClickCapture={handleClickCapture}
+        onClick={handleClickToSelect}
+        style={{
+          transform: transformStyle,
+          cursor: canDrag ? "grab" : "default",
+          touchAction: "none",
+          willChange: "transform",
+        }}
+      >
+        <WrappedComponent {...props} moved={moved} />
+      </div>
+    );
+  };
+}
+
+// ------------------ InertiaGuts ------------------
+// ------------------ Shape canvas (WebGL) ------------------
+
+/// Positions arrive already normalized to the container the canvas fills, with
+/// a top-left origin — the same space the Metal and GLES runtimes hand their
+/// renderers — so the only work here is the flip into clip space.
+const SHAPE_VERTEX_SHADER = `
+attribute vec2 a_position;
+attribute vec4 a_color;
+varying vec4 v_color;
+
+void main() {
+    v_color = a_color;
+    gl_Position = vec4(a_position.x * 2.0 - 1.0, 1.0 - a_position.y * 2.0, 0.0, 1.0);
+}
+`;
+
+/// Colours pass through unpremultiplied; the context is created to match, and
+/// the blend function does the source-over.
+const SHAPE_FRAGMENT_SHADER = `
+precision mediump float;
+varying vec4 v_color;
+
+void main() {
+    gl_FragColor = v_color;
+}
+`;
+
+function compileShader(gl: WebGLRenderingContext, type: number, source: string): WebGLShader | null {
+    const shader = gl.createShader(type);
+    if (!shader) return null;
+
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+        console.error(`[INERTIA_LOG]: shape shader failed to compile: ${gl.getShaderInfoLog(shader)}`);
+        gl.deleteShader(shader);
+        return null;
+    }
+
+    return shader;
+}
+
+function createShapeProgram(gl: WebGLRenderingContext): WebGLProgram | null {
+    const vertex = compileShader(gl, gl.VERTEX_SHADER, SHAPE_VERTEX_SHADER);
+    const fragment = compileShader(gl, gl.FRAGMENT_SHADER, SHAPE_FRAGMENT_SHADER);
+    if (!vertex || !fragment) return null;
+
+    const program = gl.createProgram();
+    if (!program) return null;
+
+    gl.attachShader(program, vertex);
+    gl.attachShader(program, fragment);
+    gl.linkProgram(program);
+
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+        console.error(`[INERTIA_LOG]: shape program failed to link: ${gl.getProgramInfoLog(program)}`);
+        return null;
+    }
+
+    return program;
+}
+
+/// This node's size as laid out — the size the shapes behind it are measured
+/// against, since they are multiples of it.
+///
+/// Read off `offsetWidth`/`offsetHeight` rather than `getBoundingClientRect`,
+/// which reports what the browser painted: the animation writes a CSS transform
+/// on this very element, and a rect measured through a rotation is the
+/// *bounding box* of the rotated element — it swells and shrinks as the angle
+/// turns. Measuring shapes from that made them pulse in step with the spin.
+/// Offsets are layout, and layout is what the shapes are anchored to.
+function layoutSizeOf(element: HTMLElement): InertiaCanvasSize {
+    return { width: element.offsetWidth, height: element.offsetHeight };
+}
+
+/// The actionable's canvas: the shapes authored alongside its animation, drawn
+/// in WebGL behind its content.
+///
+/// Sized and placed by the box the shapes themselves occupy — `actionableSize`
+/// is the view, and the shapes are multiples of it — so one reaching past the
+/// view it belongs to grows the canvas instead of being cut at any edge. The
+/// container is not in this: a canvas fitted to it stopped a shape at the
+/// window. It sits inside the element the playback controller writes its
+/// transform to, which is what carries the shapes along with the animation.
+///
+/// A canvas given an `animation` is one shape's own drawing rather than the
+/// actionable's backdrop: it registers itself with the controller, which then
+/// writes that track's transform onto this canvas element every frame — the
+/// same way it moves an actionable, and stacked on top of the actionable's own
+/// transform because this element sits inside it.
+const InertiaShapeCanvas: React.FC<{
+    shapes: Array<InertiaShape>;
+    actionableSize: InertiaCanvasSize;
+    animation?: InertiaAnimationSchema;
+    nodeId?: string;
+    hierarchyIdPrefix?: string;
+}> = ({ shapes, actionableSize, animation, nodeId, hierarchyIdPrefix }) => {
+    const canvasRef = useRef<HTMLCanvasElement>(null);
+    const glRef = useRef<{ gl: WebGLRenderingContext; program: WebGLProgram; buffer: WebGLBuffer } | null>(null);
+    const controller = useContext(InertiaPlaybackContext);
+
+    useEffect(() => {
+        const canvas = canvasRef.current;
+        if (!canvas || !controller || !animation || !nodeId || !hierarchyIdPrefix) {
+            return;
+        }
+
+        controller.registerShapeNode(nodeId, hierarchyIdPrefix, canvas, animation);
+
+        return () => controller.unregisterNode(nodeId);
+    }, [controller, animation, nodeId, hierarchyIdPrefix]);
+
+    /// The canvas's own box, in multiples of the actionable.
+    const bounds = useMemo(() => shapeBounds(shapes), [shapes]);
+
+    /// Every shape restated in the canvas's 0..1 space and flattened into the
+    /// one triangle list the GPU draws: x, y, r, g, b, a per vertex.
+    ///
+    /// Independent of the actionable's size: resizing the view resizes the
+    /// canvas element without rebuilding a vertex of it.
+    const vertexData = useMemo(() => {
+        const data: number[] = [];
+        if (!bounds) return new Float32Array(data);
+
+        shapes.forEach(shape => {
+            shapeTriangles(normalizeShape(shape, bounds)).forEach((vertex: Vertex) => {
+                data.push(
+                    vertex.position.x,
+                    vertex.position.y,
+                    vertex.color.red,
+                    vertex.color.green,
+                    vertex.color.blue,
+                    vertex.color.alpha
+                );
+            });
+        });
+
+        return new Float32Array(data);
+    }, [shapes, bounds]);
+
+    /// The canvas element's box in CSS pixels, relative to the actionable's
+    /// top-left corner.
+    const box = useMemo(() => bounds && {
+        left: bounds.x * actionableSize.width,
+        top: bounds.y * actionableSize.height,
+        width: bounds.width * actionableSize.width,
+        height: bounds.height * actionableSize.height
+    }, [bounds, actionableSize]);
+
+    useEffect(() => {
+        const canvas = canvasRef.current;
+        if (!canvas || !box) return;
+
+        if (!glRef.current) {
+            // Unpremultiplied to match the blend function below, which is the
+            // source-over every other runtime draws with.
+            const gl = canvas.getContext("webgl", {
+                alpha: true,
+                premultipliedAlpha: false,
+                antialias: true
+            });
+            if (!gl) {
+                console.error("[INERTIA_LOG]: WebGL is unavailable; shapes will not be drawn");
+                return;
+            }
+
+            const program = createShapeProgram(gl);
+            const buffer = gl.createBuffer();
+            if (!program || !buffer) return;
+
+            glRef.current = { gl, program, buffer };
+        }
+
+        const { gl, program, buffer } = glRef.current;
+
+        // The backing store is in device pixels; the element is sized in CSS
+        // pixels by the style below.
+        const ratio = window.devicePixelRatio || 1;
+        canvas.width = Math.max(1, Math.round(box.width * ratio));
+        canvas.height = Math.max(1, Math.round(box.height * ratio));
+
+        gl.viewport(0, 0, canvas.width, canvas.height);
+        gl.clearColor(0, 0, 0, 0);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+
+        // An emptied shape list still clears, which is what takes the last
+        // frame's shapes back off the screen.
+        if (vertexData.length === 0) return;
+
+        gl.enable(gl.BLEND);
+        gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+        gl.useProgram(program);
+        gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+        gl.bufferData(gl.ARRAY_BUFFER, vertexData, gl.DYNAMIC_DRAW);
+
+        const stride = 6 * Float32Array.BYTES_PER_ELEMENT;
+
+        const positionLocation = gl.getAttribLocation(program, "a_position");
+        gl.enableVertexAttribArray(positionLocation);
+        gl.vertexAttribPointer(positionLocation, 2, gl.FLOAT, false, stride, 0);
+
+        const colorLocation = gl.getAttribLocation(program, "a_color");
+        gl.enableVertexAttribArray(colorLocation);
+        gl.vertexAttribPointer(colorLocation, 4, gl.FLOAT, false, stride, 2 * Float32Array.BYTES_PER_ELEMENT);
+
+        gl.drawArrays(gl.TRIANGLES, 0, vertexData.length / 6);
+    }, [vertexData, box]);
+
+    // Shapes enclosing no area have no canvas, which is also the state in which
+    // there is nothing to draw.
+    if (!box) return null;
+
+    return (
+        <canvas
+            ref={canvasRef}
+            style={{
+                position: "absolute",
+                left: box.left,
+                top: box.top,
+                width: box.width,
+                height: box.height,
+                pointerEvents: "none",
+                // Being first in the DOM is not enough to paint first: a
+                // positioned element paints above its in-flow siblings whatever
+                // order they are written in, so the canvas was drawing *over*
+                // the card — which reads as the shape blending through it.
+                // Negative z-index drops it below the in-flow content while
+                // staying above the actionable's own background, which is what
+                // a backdrop is. It relies on the actionable isolating itself;
+                // see the wrapper below.
+                zIndex: -1
+            }}
+        />
+    );
+};
+
+const InertiaGuts: React.FC<DraggableProps> = React.memo(
+  ({ hierarchyId, hierarchyIdPrefix, isSelected, containerRef, children, inertiaDataModel }) => {
+    const controller = useContext(InertiaPlaybackContext);
+
+    // The controller writes this element's transform every frame it draws, so
+    // registration is all there is to animating it.
+    useEffect(() => {
+      const element = containerRef.current;
+      if (!element || !controller || !hierarchyId || !hierarchyIdPrefix) {
+        return;
+      }
+
+      console.log(`[INERTIA_LOG]: [InertiaGuts] registering hierarchyId: ${hierarchyId}, hierarchyIdPrefix: ${hierarchyIdPrefix}`);
+      controller.registerNode(hierarchyId, hierarchyIdPrefix, element);
+
+      return () => {
+        controller.unregisterNode(hierarchyId);
+      };
+    }, [controller, containerRef, hierarchyId, hierarchyIdPrefix]);
+
+    /// The shapes authored against this actionable, if it has any. Read off the
+    /// schema rather than the running animation, so the backdrop is there
+    /// whether or not the animation is playing.
+    ///
+    /// Keyed on the maps rather than the model, like the container's own lookup:
+    /// a new list here rebuilds every vertex buffer and repaints the canvases,
+    /// and the model's identity changes on every selection.
+    const shapes = useMemo(() => {
+      if (!hierarchyIdPrefix || !inertiaDataModel) return [];
+
+      const animationId = inertiaDataModel.actionableIdToAnimationIdMap?.get(hierarchyIdPrefix) ?? hierarchyIdPrefix;
+      return inertiaDataModel.inertiaSchemas?.get(animationId)?.shapes ?? [];
+    }, [inertiaDataModel?.actionableIdToAnimationIdMap, inertiaDataModel?.inertiaSchemas, hierarchyIdPrefix]);
+
+    /// Remeasured whenever this node is resized. Layout is the only thing that
+    /// resizes this box — the animation writes a transform, which `layoutSizeOf`
+    /// deliberately does not see.
+    const [layoutSize, setLayoutSize] = useState<InertiaCanvasSize>({ width: 0, height: 0 });
+
+    useEffect(() => {
+      const element = containerRef.current;
+      if (!element || shapes.length === 0) return;
+
+      const measure = () => setLayoutSize(layoutSizeOf(element));
+      measure();
+
+      const observer = new ResizeObserver(measure);
+      observer.observe(element);
+
+      return () => observer.disconnect();
+    }, [containerRef, shapes]);
+
+    const hasCanvas = shapes.length > 0
+      && layoutSize.width > 0
+      && layoutSize.height > 0;
+
+    /// A shape with no animation of its own is backdrop: it belongs to the
+    /// actionable, moves only as the actionable moves, and shares one canvas
+    /// with every other shape like it. A shape that was given a track is a
+    /// drawing in its own right and gets a canvas of its own, so the controller
+    /// can move it without disturbing the actionable or the other shapes.
+    const backdrop = useMemo(() => shapes.filter(shape => !shape.animation), [shapes]);
+    const drawn = useMemo(
+      () => shapes
+        .map((shape, index) => ({ shape, index }))
+        .filter(({ shape }) => !!shape.animation),
+      [shapes]
+    );
+
+    return (
+      <div
+        data-inertia-id={hierarchyId}
+        ref={containerRef}
+        style={{
+          display: "inline-block",
+          cursor: inertiaDataModel?.isActionable ? "pointer" : "default",
+          position: "relative",
+          pointerEvents: inertiaDataModel?.isActionable ? "auto" : "none",
+          // Keeps the canvas's negative z-index inside this actionable. Without
+          // a stacking context of its own the canvas would sink past this
+          // element entirely and end up behind whatever the container paints —
+          // and only while the animation happened to be writing a transform,
+          // which forms one as a side effect, so it would come and go with
+          // playback.
+          isolation: "isolate",
+        }}
+      >
+        {/* Painted behind the content by the canvas's own z-index. */}
+        {hasCanvas && backdrop.length > 0 && (
+          <InertiaShapeCanvas
+            shapes={backdrop}
+            actionableSize={layoutSize}
+          />
+        )}
+
+        {/* One canvas each, moved by the track each was authored with. Drawn
+            over the backdrop in the order they were authored — shapes have no
+            z-index of their own, and the file's order is the only ordering
+            anyone has expressed. */}
+        {hasCanvas && drawn.map(({ shape, index }) => (
+          <InertiaShapeCanvas
+            key={`${hierarchyId}--shape--${index}`}
+            shapes={[shape]}
+            actionableSize={layoutSize}
+            animation={shape.animation}
+            nodeId={hierarchyId ? `${hierarchyId}--shape--${index}` : undefined}
+            hierarchyIdPrefix={hierarchyIdPrefix}
+          />
+        ))}
+
+        <div
+          style={{
+            pointerEvents: inertiaDataModel?.isActionable ? "none" : "auto",
+          }}
+        >
+          {children}
+        </div>
+
+        {isSelected && inertiaDataModel?.isActionable && (
+          <div
+            style={{
+              position: "absolute",
+              top: 0,
+              left: 0,
+              right: 0,
+              bottom: 0,
+              border: "3px solid rgb(85, 89, 220)",
+              borderRadius: 8,
+              pointerEvents: "none",
+            }}
+          />
+        )}
+      </div>
+    );
+  }
+);
+
+
+export const DraggableInertiaGuts = React.memo(withDrag(InertiaGuts));
+
+// ------------------ Inertia ------------------
+export const Inertia: React.FC<InertiaProps> = ({ children, id }) => {
+  /// The id the app authored against, which every instance of this actionable
+  /// shares. What playback is keyed by, and what a schema loaded from a project
+  /// file is named after.
+  const hierarchyIdPrefix = id;
+  const { inertiaDataModel, setInertiaDataModel } = useContext(InertiaContext)!;
+  const inertiaParentId = useContext(InertiaParentIdContext)!;
+  const inertiaIsContainer = useContext(InertiaIsContainerContext)!;
+  const indexManager = SharedIndexManager.shared;
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  const [pos, setPos] = useState({ x: 0, y: 0 });
+  /// This instance's own id: the authored id plus its index among its siblings.
+  const [instanceId, setInstanceId] = useState<string>();
+
+  useEffect(() => {
+    const indexValue = indexManager.indexMap[hierarchyIdPrefix] ?? 0;
+
+    const newId = `${hierarchyIdPrefix}--${indexValue}`;
+    indexManager.indexMap[hierarchyIdPrefix] = indexValue + 1;
+    setInstanceId(newId);
+  }, [hierarchyIdPrefix]);
+
+  useEffect(() => {
+    if (instanceId) {
+      inertiaDataModel?.tree.addRelationship(instanceId, inertiaParentId, inertiaIsContainer);
+    }
+  }, [instanceId, inertiaParentId, inertiaIsContainer]);
+
+  /// The translation the schema starts this actionable at. The playback
+  /// controller writes it as the node's own transform, so `pos` — the drag that
+  /// sits on top of it — goes back to zero whenever it changes: by then the
+  /// gesture has been authored into the schema, and leaving it in place would
+  /// count the same move twice. It is also what returns a node to the origin
+  /// when the editor resets an animation's initial values.
+  ///
+  /// Resolved by prefix, the way the controller resolves the schema it draws.
+  const initialTranslate = useMemo(() => {
+    if (!inertiaDataModel) return null;
+
+    const animationId = inertiaDataModel.actionableIdToAnimationIdMap?.get(hierarchyIdPrefix) ?? hierarchyIdPrefix;
+    return inertiaDataModel.inertiaSchemas?.get(animationId)?.initialValues?.translate ?? null;
+  }, [inertiaDataModel, hierarchyIdPrefix]);
+
+  /// Keyed on the values themselves rather than on the data model: any other
+  /// update — a selection, say — would otherwise drop a drag the editor has not
+  /// been told about yet, snapping the node out from under the cursor.
+  useEffect(() => {
+    setPos({x: 0, y: 0});
+  }, [initialTranslate?.[0], initialTranslate?.[1]])
+
+  const isSelected = instanceId ? Array.from(inertiaDataModel?.actionableIdPairs ?? []).some(pair => pair.hierarchyId === instanceId) : false;
+
+  const handleClick = () => {
+  if (!instanceId || !hierarchyIdPrefix || !inertiaDataModel?.isActionable) return;
+
+  const pair: ActionableIdPair = { hierarchyIdPrefix, hierarchyId: instanceId };
+
+  setInertiaDataModel(prev => {
+    const currentPairs = prev.actionableIdPairs ?? new Set<ActionableIdPair>();
+    const exists = Array.from(currentPairs).some(p => p.hierarchyId === instanceId);
+
+    const newPairs = exists
+      ? new Set(Array.from(currentPairs).filter(p => p.hierarchyId !== instanceId))
+      : new Set([...Array.from(currentPairs), pair]);
+
+    // Send update outside of setState for clarity
+    manager.sendMessageActionables({
+      tree: prev.tree,
+      actionableIds: Array.from(newPairs),
+    });
+
+    return { ...prev, actionableIdPairs: newPairs };
+  });
+};
+
+
+  return (
+    <DraggableInertiaGuts
+      key={instanceId}
+      hierarchyId={instanceId}
+      hierarchyIdPrefix={hierarchyIdPrefix}
+      handleClick={handleClick}
+      isSelected={isSelected}
+      containerRef={containerRef}
+      children={children}
+      inertiaDataModel={inertiaDataModel}
+      actionableIdPairs={inertiaDataModel?.actionableIdPairs}
+      pos={pos}
+      setPos={setPos}
+    />
+  );
+};
