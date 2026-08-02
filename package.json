@@ -1,6 +1,6 @@
 {
   "name": "inertia-react",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "repository": "github:hpennington/inertia-react",
   "description": "",
   "main": "dist/index.min.js",
