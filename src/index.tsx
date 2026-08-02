@@ -1,5 +1,6 @@
 import React from 'react'
-import {InertiaAnimationSchema, MessageTranslation, MessageActionables, MessageActionable, InertiaSchemaWrapper, InertiaAnimationInvokeType, WebSocketClient, InertiaDataModel, InertiaCanvasSize, MessageType, MessageWrapper, InertiaID, Tree, Node, ActionableIdPair, AnimationSignal, MessagePlaybackProgress, InertiaPlayback, valuesAtTime, sanitizeValues, trackDuration, InertiaShape, Vertex, shapeTriangles, shapeBounds, normalizeShape, InertiaAnimationValues as InertiaAnimationValuesBase} from 'inertia-base'
+import {decode} from '@msgpack/msgpack'
+import {InertiaAnimationSchema, MessageTranslation, MessageActionables, MessageActionable, InertiaSchemaWrapper, InertiaAnimationInvokeType, WebSocketClient, InertiaDataModel, InertiaCanvasSize, MessageType, MessageWrapper, InertiaID, Tree, Node, ActionableIdPair, AnimationSignal, MessagePlaybackProgress, InertiaPlayback, valuesAtTime, sanitizeValues, trackDuration, InertiaShape, Vertex, shapeTriangles, shapeBounds, normalizeShape, inertiaFileExtension, InertiaAnimationValues as InertiaAnimationValuesBase} from 'inertia-base'
 
 export type InertiaContainerProps = {
     children: React.ReactElement,
@@ -832,7 +833,7 @@ export const InertiaContainer = ({ children, dev, id, hierarchyId, baseURL }: In
     }
     const guides = guidesRef.current;
 
-    // Load animation schemas from JSON file if not in dev mode
+    // Load animation schemas from the shipped animation file if not in dev mode
     React.useEffect(() => {
         console.log(`[INERTIA_LOG]: InertiaContainer init - dev: ${dev}, id: ${id}, baseURL: ${baseURL}`);
 
@@ -841,11 +842,12 @@ export const InertiaContainer = ({ children, dev, id, hierarchyId, baseURL }: In
             return;
         }
 
-        console.log(`[INERTIA_LOG]: Production mode - attempting to load ${baseURL}/${id}.json`);
+        const fileName = `${id}.${inertiaFileExtension}`;
+        console.log(`[INERTIA_LOG]: Production mode - attempting to load ${baseURL}/${fileName}`);
 
         const loadAnimations = async () => {
             try {
-                const url = `${baseURL}/${id}.json`;
+                const url = `${baseURL}/${fileName}`;
                 console.log(`[INERTIA_LOG]: Fetching ${url}`);
                 const response = await fetch(url);
 
@@ -854,8 +856,9 @@ export const InertiaContainer = ({ children, dev, id, hierarchyId, baseURL }: In
                     return;
                 }
 
-                const schemas: InertiaAnimationSchema[] = await response.json();
-                console.log(`[INERTIA_LOG]: Loaded ${schemas.length} schemas from ${id}.json`, schemas);
+                // Read as bytes: the file is MessagePack, not text.
+                const schemas = decode(new Uint8Array(await response.arrayBuffer())) as InertiaAnimationSchema[];
+                console.log(`[INERTIA_LOG]: Loaded ${schemas.length} schemas from ${fileName}`, schemas);
 
                 const schemaMap = new Map<string, InertiaAnimationSchema>();
                 const actionableIdToAnimationIdMap = new Map<string, string>();
@@ -875,7 +878,7 @@ export const InertiaContainer = ({ children, dev, id, hierarchyId, baseURL }: In
                     actionableIdToAnimationIdMap
                 }));
             } catch (error) {
-                console.error(`[INERTIA_LOG]: Error loading animation file ${id}.json:`, error);
+                console.error(`[INERTIA_LOG]: Error loading animation file ${fileName}:`, error);
             }
         };
 

@@ -1,6 +1,6 @@
 {
   "name": "inertia-react",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "repository": "github:hpennington/inertia-react",
   "description": "",
   "main": "dist/index.min.js",
@@ -29,6 +29,7 @@
     "react-dom": "18.3.1"
   },
   "dependencies": {
+    "@msgpack/msgpack": "^3.0.0",
     "inertia-base": "^0.1.0",
     "net": "^1.0.2"
   }
