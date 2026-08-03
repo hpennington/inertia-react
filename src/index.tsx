@@ -1160,6 +1160,40 @@ export interface DraggableInjectedProps {
 const HANDLE_COLOR = "rgb(46, 182, 125)";
 const HANDLE_ATTRIBUTE = "data-inertia-handle";
 
+/// Which way one of the move tool's axis arrows lets a drag move the node.
+///
+/// The node's own body stays free in both directions; an arrow pins one component
+/// of the drag to zero, for the moves that have to keep a row or a column. Screen
+/// axes, not the node's own — the arrows are counter-rotated out of whatever the
+/// node has been turned by, since horizontal and vertical are the screen's.
+export type InertiaTranslateAxis = "horizontal" | "vertical";
+
+const TRANSLATE_AXES: InertiaTranslateAxis[] = ["horizontal", "vertical"];
+
+/// The value each arrow carries in `HANDLE_ATTRIBUTE`, which is how a press is
+/// traced back to the axis it picked.
+const axisHandleName = (axis: InertiaTranslateAxis): string => `translate-${axis}`;
+
+/// The axis a press picked, or `null` for anywhere else — the body of the node
+/// included, which is a free move.
+const axisFromHandle = (name: string | null | undefined): InertiaTranslateAxis | null =>
+  TRANSLATE_AXES.find((axis) => axisHandleName(axis) === name) ?? null;
+
+/// The drag with the component this axis does not author dropped.
+const constrainToAxis = (
+  axis: InertiaTranslateAxis | null,
+  delta: { x: number; y: number }
+): { x: number; y: number } => {
+  switch (axis) {
+    case "horizontal":
+      return { x: delta.x, y: 0 };
+    case "vertical":
+      return { x: 0, y: delta.y };
+    default:
+      return delta;
+  }
+};
+
 /// A node scaled to nothing has no box left to grab. Chrome is divided through
 /// by the scale the node is drawn at so it keeps its size on screen.
 const chromeScaleFor = (scale: number): number =>
@@ -1177,7 +1211,6 @@ export const InertiaToolHandles: React.FC<{
   values: InertiaAnimationValuesBase;
   size: { width: number; height: number };
 }> = ({ tool, values, size }) => {
-  if (tool === InertiaTool.translate) return null;
   if (!(size.width > 0) || !(size.height > 0)) return null;
 
   const chrome = chromeScaleFor(values.scale);
@@ -1230,6 +1263,114 @@ export const InertiaToolHandles: React.FC<{
   );
 
   const parts: React.ReactNode[] = [];
+
+  if (tool === InertiaTool.translate) {
+    // From the node's edge out to an arrow's tail, and the head's own length and
+    // half-width. Counter-scaled, so an arrow keeps its size on screen however
+    // far the node has been scaled — the same as every other piece of chrome.
+    const axisGap = 22 * chrome;
+    const axisLength = 14 * chrome;
+    const axisHalfWidth = 7 * chrome;
+    /// How close a press has to land to an arrow to take it. Generous next to
+    /// the arrow itself, which is small.
+    const axisTouch = 24 * chrome;
+    const stem = 2 * chrome;
+    const axisParts: React.ReactNode[] = [];
+
+    TRANSLATE_AXES.forEach((axis) => {
+      const isHorizontal = axis === "horizontal";
+      // The tail is where the stem ends and the head begins; the head runs
+      // `axisLength` further out again.
+      const tail = isHorizontal
+        ? { x: size.width + axisGap, y: center.y }
+        : { x: center.x, y: -axisGap };
+      const arrow = isHorizontal
+        ? { x: tail.x + axisLength / 2, y: tail.y }
+        : { x: tail.x, y: tail.y - axisLength / 2 };
+
+      axisParts.push(
+        <div
+          key={`stem-${axis}`}
+          style={{
+            position: "absolute",
+            left: isHorizontal ? center.x : center.x - stem / 2,
+            top: isHorizontal ? center.y - stem / 2 : tail.y,
+            width: isHorizontal ? tail.x - center.x : stem,
+            height: isHorizontal ? stem : center.y - tail.y,
+            background: HANDLE_COLOR,
+            opacity: 0.6,
+            pointerEvents: "none",
+          }}
+        />
+      );
+
+      axisParts.push(
+        // The head is a border triangle, which needs a box of its own with
+        // nothing in it — so the hit area is this square around it rather than
+        // the head's own 14 screen pixels.
+        <div
+          key={`axis-${axis}`}
+          {...{ [HANDLE_ATTRIBUTE]: axisHandleName(axis) }}
+          style={{
+            position: "absolute",
+            left: arrow.x - axisTouch,
+            top: arrow.y - axisTouch,
+            width: axisTouch * 2,
+            height: axisTouch * 2,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            pointerEvents: "auto",
+            cursor: "grab",
+            touchAction: "none",
+          }}
+        >
+          <div
+            style={{
+              width: 0,
+              height: 0,
+              // One head rather than two: both directions of an axis are
+              // draggable, and the arrow only has to read as the axis it stands
+              // for. Right for the horizontal one, up for the vertical one.
+              borderTop: `${isHorizontal ? axisHalfWidth : 0}px solid transparent`,
+              borderBottom: isHorizontal
+                ? `${axisHalfWidth}px solid transparent`
+                : `${axisLength}px solid ${HANDLE_COLOR}`,
+              borderLeft: isHorizontal
+                ? `${axisLength}px solid ${HANDLE_COLOR}`
+                : `${axisHalfWidth}px solid transparent`,
+              borderRight: `${isHorizontal ? 0 : axisHalfWidth}px solid transparent`,
+            }}
+          />
+        </div>
+      );
+    });
+
+    parts.push(
+      // Turned back out of whatever the node has been turned by, as one group.
+      // Undoing the sum of its two rotations about this group's own center leaves
+      // that center exactly where the node's transform put it — a rotation fixes
+      // its own anchor — and cancels the turn the arrows would otherwise inherit,
+      // since a uniform scale commutes with a rotation. What is left points along
+      // the screen's axes, which is what an arrow pins a move to.
+      <div
+        key="axes"
+        style={{
+          position: "absolute",
+          left: 0,
+          top: 0,
+          width: size.width,
+          height: size.height,
+          transformOrigin: "center",
+          transform: `rotate(${-(values.rotate + values.rotateCenter)}deg)`,
+          overflow: "visible",
+          pointerEvents: "none",
+        }}
+      >
+        {axisParts}
+      </div>
+    );
+  }
 
   if (tool === InertiaTool.rotate) {
     // Out along the box's diagonal, so the knob reads as belonging to the corner
@@ -1362,6 +1503,10 @@ type ToolGestureStart = {
   reference: { x: number; y: number };
   /// The pointer's opening position, in the container's space.
   origin: { x: number; y: number };
+  /// The axis the arrow this opened on pins a move to, for the move tool, and
+  /// `null` for a press on the node itself — which is free in both. Taken at the
+  /// press, because the arrow travels with the node the drag is moving.
+  axis: InertiaTranslateAxis | null;
   /// The node's transform when the gesture began, and the edit already folded
   /// into it.
   values: InertiaAnimationValuesBase;
@@ -1450,7 +1595,11 @@ export function withDrag<T extends DraggableProps>(
       return { x: clientX - rect.left, y: clientY - rect.top };
     };
 
-    const beginGesture = (clientX: number, clientY: number) => {
+    const beginGesture = (
+      clientX: number,
+      clientY: number,
+      axis: InertiaTranslateAxis | null
+    ) => {
       const element = containerRef.current;
       const container = inertiaContainerRef?.current;
       if (!element || !container) return;
@@ -1479,6 +1628,7 @@ export function withDrag<T extends DraggableProps>(
         anchor,
         reference: { x: origin.x - anchor.x, y: origin.y - anchor.y },
         origin,
+        axis,
         values,
         edit,
         center,
@@ -1503,14 +1653,22 @@ export function withDrag<T extends DraggableProps>(
       const current = { x: point.x - opening.anchor.x, y: point.y - opening.anchor.y };
 
       switch (tool) {
-        case InertiaTool.translate:
+        case InertiaTool.translate: {
+          // The body of the node moves freely; an axis arrow authors only its own
+          // component of the same drag.
+          const delta = constrainToAxis(opening.axis, {
+            x: point.x - opening.origin.x,
+            y: point.y - opening.origin.y,
+          });
+
           return {
             ...opening.edit,
             translate: [
-              opening.edit.translate[0] + (point.x - opening.origin.x),
-              opening.edit.translate[1] + (point.y - opening.origin.y),
+              opening.edit.translate[0] + delta.x,
+              opening.edit.translate[1] + delta.y,
             ],
           };
+        }
 
         case InertiaTool.rotate:
         case InertiaTool.rotateCenter: {
@@ -1649,12 +1807,14 @@ export function withDrag<T extends DraggableProps>(
       if (!moved.current) handleClick();
     };
 
-    /// Whether this press landed on one of the active tool's knobs. The handles
+    /// Which of the active tool's knobs this press landed on, if any. The handles
     /// are drawn deep inside the node, but the gesture is run from out here,
     /// where the pointer capture lives — so the press is routed by what it hit
     /// rather than by which element listens.
-    const isHandlePress = (target: EventTarget | null): boolean =>
-      target instanceof Element && target.closest(`[${HANDLE_ATTRIBUTE}]`) !== null;
+    const handleAt = (target: EventTarget | null): string | null =>
+      target instanceof Element
+        ? target.closest(`[${HANDLE_ATTRIBUTE}]`)?.getAttribute(HANDLE_ATTRIBUTE) ?? null
+        : null;
 
     const toolHandles = canEdit ? (
       <InertiaToolHandles tool={tool} values={values} size={layoutBox} />
@@ -1664,11 +1824,12 @@ export function withDrag<T extends DraggableProps>(
       <div
         onPointerDown={(e) => {
           e.stopPropagation();
-          const onHandle = isHandlePress(e.target);
+          const handle = handleAt(e.target);
+          const onHandle = handle !== null;
           if (!canDragBody && !onHandle) return;
 
           (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-          beginGesture(e.clientX, e.clientY);
+          beginGesture(e.clientX, e.clientY, axisFromHandle(handle));
           // A press on a knob is never a click on the node. Without this,
           // grabbing a handle and letting go without moving would fall through
           // to the selection toggle and deselect the thing being edited.
