@@ -1,6 +1,6 @@
 import React from 'react'
 import {decode} from '@msgpack/msgpack'
-import {InertiaAnimationSchema, MessageTranslation, MessageActionables, MessageActionable, InertiaSchemaWrapper, InertiaAnimationInvokeType, WebSocketClient, InertiaDataModel, InertiaCanvasSize, MessageType, MessageWrapper, InertiaID, Tree, Node, ActionableIdPair, AnimationSignal, MessagePlaybackProgress, InertiaPlayback, valuesAtTime, sanitizeValues, trackDuration, InertiaShape, Vertex, shapeTriangles, shapeBounds, normalizeShape, inertiaFileExtension, InertiaAnimationValues as InertiaAnimationValuesBase} from 'inertia-base'
+import {InertiaAnimationSchema, MessageTranslation, MessageActionables, MessageActionable, InertiaSchemaWrapper, InertiaAnimationInvokeType, WebSocketClient, InertiaDataModel, InertiaCanvasSize, MessageType, MessageWrapper, InertiaID, Tree, Node, ActionableIdPair, AnimationSignal, MessagePlaybackProgress, InertiaPlayback, valuesAtTime, sanitizeValues, trackDuration, InertiaShape, Vertex, shapeTriangles, shapeBounds, normalizeShape, inertiaFileExtension, InertiaTool, InertiaToolEdit, identityValues, noToolEdit, isNoToolEdit, addToolEdits, applyToolEdit, minimumToolScale, InertiaAnimationValues as InertiaAnimationValuesBase} from 'inertia-base'
 
 export type InertiaContainerProps = {
     children: React.ReactElement,
@@ -172,6 +172,17 @@ export class InertiaPlaybackController {
     private schemas = new Map<string, InertiaAnimationSchema>();
     private states = new Map<string, ActionableState>();
     private canvasSize: InertiaCanvasSize | null = null;
+    /// The editor's in-progress gestures, by node.
+    ///
+    /// Drawn here rather than as a transform on a wrapper around the node: what
+    /// the editor is sent is a single set of values, and composing the gesture
+    /// into the same matrix the schema is drawn with is what makes the node's
+    /// appearance agree with them. A wrapper would multiply the two instead,
+    /// which is a different transform whenever both are doing something.
+    private edits = new Map<string, InertiaToolEdit>();
+    /// What each node was last drawn at, gesture included — what the tool
+    /// handles size themselves against and what the readout shows.
+    private renderedValues = new Map<string, InertiaAnimationValuesBase>();
 
     /// How long one loop lasts, as set on the editor's timeline. Applies from
     /// the next frame, so resizing the timeline mid-run stretches the loop
@@ -304,6 +315,29 @@ export class InertiaPlaybackController {
             node.element.style.opacity = "";
         }
         this.nodes.delete(hierarchyId);
+        this.edits.delete(hierarchyId);
+        this.renderedValues.delete(hierarchyId);
+    }
+
+    /// Shows what an editor gesture has produced so far on one node. Nothing is
+    /// authored by this — the schema is unchanged until the editor sends one
+    /// back — so it is dropped again the moment the gesture is let go and the
+    /// edit it settled at arrives as `initialValues`.
+    public setEdit(hierarchyId: string, edit: InertiaToolEdit | null): void {
+        if (!edit || isNoToolEdit(edit)) {
+            if (!this.edits.delete(hierarchyId)) return;
+        } else {
+            this.edits.set(hierarchyId, edit);
+        }
+
+        this.renderNode(hierarchyId);
+    }
+
+    /// What `hierarchyId` is currently drawn at. The identity transform for a
+    /// node that has neither a schema nor a gesture, which is what an actionable
+    /// nobody has animated yet is sitting at.
+    public valuesFor(hierarchyId: string): InertiaAnimationValuesBase {
+        return this.renderedValues.get(hierarchyId) ?? identityValues;
     }
 
     private get hasTriggeredActionable(): boolean {
@@ -552,10 +586,20 @@ export class InertiaPlaybackController {
             return;
         }
 
+        const edit = this.edits.get(hierarchyId) ?? null;
         const schema = node.schema ?? this.schemas.get(node.hierarchyIdPrefix);
         if (!schema) {
-            node.element.style.transform = "";
-            node.element.style.opacity = "";
+            // Still drawn when the editor is dragging it: an actionable nobody
+            // has animated yet has no schema until the first gesture is written
+            // into one, and it has to move under the cursor before then.
+            if (!edit) {
+                this.renderedValues.delete(hierarchyId);
+                node.element.style.transform = "";
+                node.element.style.opacity = "";
+                return;
+            }
+
+            this.write(hierarchyId, node, applyToolEdit(identityValues, edit, this.canvasSize));
             return;
         }
 
@@ -572,9 +616,20 @@ export class InertiaPlaybackController {
         // parked playhead draws the same way a running one does.
         const isShowingTrack = isPlayable && (this.isRunning || this.seekTime !== null);
 
-        const values = isShowingTrack
+        const base = isShowingTrack
             ? valuesAtTime(schema, this.playheadTime, this.playbackDuration, this.isRepeating)
             : sanitizeValues(schema.initialValues);
+
+        this.write(hierarchyId, node, applyToolEdit(base, edit, this.canvasSize));
+    }
+
+    /// Puts one set of values on screen.
+    private write(hierarchyId: string, node: RegisteredNode, values: InertiaAnimationValuesBase): void {
+        if (!this.canvasSize) {
+            return;
+        }
+
+        this.renderedValues.set(hierarchyId, values);
 
         // Written outermost-first, which is the order the SwiftUI runtime stacks
         // its modifiers in — offset, then rotateCenter, then rotate, then scale —
@@ -999,6 +1054,11 @@ export const InertiaContainer = ({ children, dev, id, hierarchyId, baseURL }: In
                 controller.applySignal(signal, sequence);
             };
 
+            ws.messageReceivedTool = (tool) => {
+                console.log(`[INERTIA_LOG]: Received messageReceivedTool: ${tool}`);
+                setInertiaDataModel(prev => ({ ...prev, activeTool: tool }));
+            };
+
             console.log(`[INERTIA_LOG]: Sending initial MessageActionables`);
             ws.sendMessageActionables({
                 tree: inertiaDataModel.tree,
@@ -1070,134 +1130,508 @@ export interface DraggableProps {
   children: React.ReactNode;
   handleClick: () => void;
   inertiaDataModel?: InertiaDataModel;
-  pos: { x: number; y: number };
-  setPos: React.Dispatch<React.SetStateAction<{ x: number; y: number }>>;
+  /// Everything the editor's gestures have added on top of this node's schema,
+  /// still waiting for the editor to fold them in. The drag reports movement
+  /// relative to its own start, so without carrying this every gesture after the
+  /// first would snap the node back to where its schema puts it.
+  edit: InertiaToolEdit;
+  setEdit: React.Dispatch<React.SetStateAction<InertiaToolEdit>>;
+  /// The values this node's schema starts it at, which an edit is measured from
+  /// and which the editor is told the total of.
+  initialValues?: InertiaAnimationValuesBase;
   moved?: React.MutableRefObject<boolean>;
+  /// The chrome for the active tool. Built by the drag wrapper, which owns the
+  /// gesture, and drawn by the wrapped component, which is inside everything
+  /// that transforms the node — so the handles stay glued to it as it turns and
+  /// scales.
+  toolHandles?: React.ReactNode;
 }
 
 // ------------------ HOC ------------------
 export interface DraggableInjectedProps {
-  pos: { x: number; y: number };
-  setPos: React.Dispatch<React.SetStateAction<{ x: number; y: number }>>;
+  edit: InertiaToolEdit;
+  setEdit: React.Dispatch<React.SetStateAction<InertiaToolEdit>>;
   moved: React.MutableRefObject<boolean>;
+  toolHandles?: React.ReactNode;
 }
+
+// ------------------ Tool handles ------------------
+
+const HANDLE_COLOR = "rgb(46, 182, 125)";
+const HANDLE_ATTRIBUTE = "data-inertia-handle";
+
+/// A node scaled to nothing has no box left to grab. Chrome is divided through
+/// by the scale the node is drawn at so it keeps its size on screen.
+const chromeScaleFor = (scale: number): number =>
+  Number.isFinite(scale) && scale > minimumToolScale ? 1 / scale : 1;
+
+/// The handles a selected actionable shows for the active tool.
+///
+/// Rendered inside the node, so the browser's own transform carries them: a
+/// rotation ring turns with what it turns, the way it does in the SwiftUI
+/// runtime's overlay. Only the knobs take pointer events — the rings, tracks and
+/// readout are decoration, and a gesture is opened by whichever knob was hit
+/// (see `HANDLE_ATTRIBUTE`, which is what the drag wrapper looks for).
+export const InertiaToolHandles: React.FC<{
+  tool: InertiaTool;
+  values: InertiaAnimationValuesBase;
+  size: { width: number; height: number };
+}> = ({ tool, values, size }) => {
+  if (tool === InertiaTool.translate) return null;
+  if (!(size.width > 0) || !(size.height > 0)) return null;
+
+  const chrome = chromeScaleFor(values.scale);
+  const knobRadius = 6 * chrome;
+  const knobGap = 22 * chrome;
+  const lineWidth = 1 * chrome;
+
+  const center = { x: size.width / 2, y: size.height / 2 };
+
+  const knob = (key: string, at: { x: number; y: number }) => (
+    <div
+      key={key}
+      {...{ [HANDLE_ATTRIBUTE]: tool }}
+      style={{
+        position: "absolute",
+        left: at.x - knobRadius,
+        top: at.y - knobRadius,
+        width: knobRadius * 2,
+        height: knobRadius * 2,
+        borderRadius: "50%",
+        background: HANDLE_COLOR,
+        border: `${lineWidth}px solid white`,
+        boxSizing: "border-box",
+        pointerEvents: "auto",
+        cursor: "grab",
+        touchAction: "none",
+        // The knob is small and the gesture has to start on it; the hit area is
+        // held out to a finger's worth however far the node has been scaled down.
+        outline: `${knobRadius}px solid transparent`,
+      }}
+    />
+  );
+
+  const ring = (key: string, at: { x: number; y: number }, radius: number) => (
+    <div
+      key={key}
+      style={{
+        position: "absolute",
+        left: at.x - radius,
+        top: at.y - radius,
+        width: radius * 2,
+        height: radius * 2,
+        borderRadius: "50%",
+        border: `${lineWidth}px dashed ${HANDLE_COLOR}`,
+        opacity: 0.6,
+        boxSizing: "border-box",
+        pointerEvents: "none",
+      }}
+    />
+  );
+
+  const parts: React.ReactNode[] = [];
+
+  if (tool === InertiaTool.rotate) {
+    // Out along the box's diagonal, so the knob reads as belonging to the corner
+    // it turns about.
+    const diagonal = Math.max(Math.hypot(size.width, size.height), 1);
+    const at = {
+      x: -(size.width / diagonal) * knobGap,
+      y: -(size.height / diagonal) * knobGap,
+    };
+    parts.push(ring("ring", { x: 0, y: 0 }, Math.hypot(at.x, at.y)));
+    parts.push(knob("knob", at));
+  }
+
+  if (tool === InertiaTool.rotateCenter) {
+    parts.push(ring("ring", center, size.height / 2 + knobGap));
+    parts.push(knob("knob", { x: center.x, y: -knobGap }));
+  }
+
+  if (tool === InertiaTool.scale) {
+    const corners = [
+      { x: 0, y: 0 },
+      { x: size.width, y: 0 },
+      { x: 0, y: size.height },
+      { x: size.width, y: size.height },
+    ];
+    corners.forEach((corner, index) => parts.push(knob(`corner-${index}`, corner)));
+  }
+
+  if (tool === InertiaTool.opacity) {
+    const width = Math.max(size.width, 60 * chrome);
+    const height = 4 * chrome;
+    const left = (size.width - width) / 2;
+    const top = size.height + knobGap;
+    const filled = width * Math.min(1, Math.max(0, values.opacity));
+
+    parts.push(
+      <div
+        key="track"
+        style={{
+          position: "absolute",
+          left,
+          top,
+          width,
+          height,
+          borderRadius: height,
+          background: HANDLE_COLOR,
+          opacity: 0.25,
+          pointerEvents: "none",
+        }}
+      />
+    );
+    parts.push(
+      <div
+        key="fill"
+        style={{
+          position: "absolute",
+          left,
+          top,
+          width: filled,
+          height,
+          borderRadius: height,
+          background: HANDLE_COLOR,
+          pointerEvents: "none",
+        }}
+      />
+    );
+    parts.push(knob("knob", { x: left + filled, y: top + height / 2 }));
+  }
+
+  const readout = (() => {
+    switch (tool) {
+      case InertiaTool.rotate:
+        return `${values.rotate.toFixed(0)}°`;
+      case InertiaTool.rotateCenter:
+        return `${values.rotateCenter.toFixed(0)}°`;
+      case InertiaTool.scale:
+        return `${values.scale.toFixed(2)}×`;
+      case InertiaTool.opacity:
+        return `${(values.opacity * 100).toFixed(0)}%`;
+      default:
+        return null;
+    }
+  })();
+
+  return (
+    <div
+      style={{
+        position: "absolute",
+        top: 0,
+        left: 0,
+        width: size.width,
+        height: size.height,
+        // Every knob hangs outside the node's own box and has to stay both
+        // visible and hittable.
+        overflow: "visible",
+        pointerEvents: "none",
+      }}
+    >
+      {parts}
+
+      {readout !== null && (
+        <div
+          style={{
+            position: "absolute",
+            left: 0,
+            top: -knobGap - 30 * chrome,
+            padding: `${4 * chrome}px ${9 * chrome}px`,
+            borderRadius: 999,
+            background: HANDLE_COLOR,
+            color: "white",
+            font: `600 ${17 * chrome}px ui-monospace, SFMono-Regular, Menlo, monospace`,
+            whiteSpace: "nowrap",
+            pointerEvents: "none",
+          }}
+        >
+          {readout}
+        </div>
+      )}
+    </div>
+  );
+};
+
+/// Where a gesture opened, taken once so its math stays measured against the
+/// transform the node had before the drag rather than the one it is being given.
+type ToolGestureStart = {
+  /// The point the gesture turns or scales about, in the container's space.
+  anchor: { x: number; y: number };
+  /// The pointer's opening vector from `anchor`, which an angle or a distance
+  /// ratio is taken relative to.
+  reference: { x: number; y: number };
+  /// The pointer's opening position, in the container's space.
+  origin: { x: number; y: number };
+  /// The node's transform when the gesture began, and the edit already folded
+  /// into it.
+  values: InertiaAnimationValuesBase;
+  edit: InertiaToolEdit;
+  /// The node's drawn center and laid-out size when the gesture began — what
+  /// the guides are boxed against.
+  center: { x: number; y: number };
+  size: { width: number; height: number };
+};
 
 export function withDrag<T extends DraggableProps>(
   WrappedComponent: React.ComponentType<T & Partial<DraggableInjectedProps>>
 ) {
-  return function Draggable(props: T & { pos: { x: number; y: number }; setPos: React.Dispatch<React.SetStateAction<{ x: number; y: number }>> }) {
-    const { isSelected, actionableIdPairs, pos, setPos, containerRef, handleClick, inertiaDataModel } = props;
+  return function Draggable(props: T & { edit: InertiaToolEdit; setEdit: React.Dispatch<React.SetStateAction<InertiaToolEdit>> }) {
+    const { hierarchyId, isSelected, actionableIdPairs, edit, setEdit, initialValues, containerRef, handleClick, inertiaDataModel } = props;
 
     /// Selection alone is not enough. Turning the editor's switch off leaves
     /// `actionableIdPairs` as it was — the editor keeps the selection so it can
     /// be restored — so nodes selected beforehand stay `isSelected` and would
     /// go on dragging against an editor that has stopped taking edits. Same
     /// pair of conditions the Swift and Compose runtimes gate their gestures on.
-    const canDrag = isSelected && (inertiaDataModel?.isActionable ?? false);
+    const canEdit = isSelected && (inertiaDataModel?.isActionable ?? false);
+    const tool = inertiaDataModel?.activeTool ?? InertiaTool.translate;
+    /// The whole node is the handle for the move tool, and only for it. Every
+    /// other tool edits through its knobs, so a drag across the body of a node
+    /// does nothing — the way a modal tool behaves in any other editor.
+    const canDragBody = canEdit && tool === InertiaTool.translate;
 
-    const dragging = useRef(false);
+    const start = useRef<ToolGestureStart | null>(null);
     const moved = useRef(false);
-    const offset = useRef({ x: 0, y: 0 });
+    /// The node's laid-out box, which is what the handles are placed around.
+    /// Measured into state rather than read off the ref while rendering: a ref
+    /// read is not reactive, so handles would keep the size the node had when
+    /// something else last happened to re-render it.
+    const [layoutBox, setLayoutBox] = useState({ width: 0, height: 0 });
 
     const inertiaCanvasSize = useContext(InertiaCanvasSizeContext);
     const inertiaContainerRef = useContext(InertiaContainerElementContext);
     const guides = useContext(InertiaGuidesContext);
+    const controller = useContext(InertiaPlaybackContext);
 
-    /// This node's laid-out center in the container's coordinate space with the
-    /// drag transform backed out, and the size the guides box in.
-    const baseCenter = useRef({ x: 0, y: 0 });
-    const nodeSize = useRef({ width: 0, height: 0 });
+    /// The node as it is drawn right now, gesture included — read from the
+    /// controller, which is what put it there.
+    const values = hierarchyId && controller ? controller.valuesFor(hierarchyId) : identityValues;
 
-    /// Taken once, at the start of a gesture, rather than on every move:
-    /// `getBoundingClientRect` reports the transform the browser has painted,
-    /// which trails `pos` by a frame, so guides read live would lag the node they
-    /// are supposed to be tracking.
-    const measure = (currentPos: { x: number; y: number }) => {
+    /// Drawn by the controller in the same matrix as the schema, rather than as
+    /// a transform on this wrapper: what the editor is sent is a single set of
+    /// values, and stacking two transforms would not be the same transform.
+    React.useLayoutEffect(() => {
+      if (!controller || !hierarchyId) return;
+      controller.setEdit(hierarchyId, canEdit ? edit : null);
+    }, [controller, hierarchyId, edit, canEdit]);
+
+    /// Where a point of the node's own laid-out box — origin at its top-left —
+    /// is drawn in the container.
+    ///
+    /// Every transform in the stack is affine and all of them but the offset
+    /// pivot somewhere inside the box, so the drawn box is the laid-out box
+    /// scaled and turned about its own drawn center. That center is measured
+    /// rather than derived, which keeps this honest whatever the page's layout
+    /// has done with the node.
+    const drawnPoint = (
+      local: { x: number; y: number },
+      center: { x: number; y: number },
+      size: { width: number; height: number },
+      at: InertiaAnimationValuesBase
+    ) => {
+      const radians = ((at.rotate + at.rotateCenter) * Math.PI) / 180;
+      const dx = (local.x - size.width / 2) * at.scale;
+      const dy = (local.y - size.height / 2) * at.scale;
+
+      return {
+        x: center.x + dx * Math.cos(radians) - dy * Math.sin(radians),
+        y: center.y + dx * Math.sin(radians) + dy * Math.cos(radians),
+      };
+    };
+
+    /// The pointer in the container's space. Measured there rather than in the
+    /// node's own: the node is being moved by the very gesture being measured,
+    /// and its coordinates move with it.
+    const inContainerSpace = (clientX: number, clientY: number) => {
+      const container = inertiaContainerRef?.current;
+      if (!container) return { x: clientX, y: clientY };
+
+      const rect = container.getBoundingClientRect();
+      return { x: clientX - rect.left, y: clientY - rect.top };
+    };
+
+    const beginGesture = (clientX: number, clientY: number) => {
       const element = containerRef.current;
       const container = inertiaContainerRef?.current;
       if (!element || !container) return;
 
-      const elementRect = element.getBoundingClientRect();
+      const rect = element.getBoundingClientRect();
       const containerRect = container.getBoundingClientRect();
 
-      nodeSize.current = { width: elementRect.width, height: elementRect.height };
-      baseCenter.current = {
-        x: elementRect.left - containerRect.left + elementRect.width / 2 - currentPos.x,
-        y: elementRect.top - containerRect.top + elementRect.height / 2 - currentPos.y,
+      // `getBoundingClientRect` reports what the browser has painted, so this is
+      // the drawn box; `offsetWidth`/`offsetHeight` are the laid-out one, which
+      // no transform touches. A rotated rectangle's bounding box is symmetric
+      // about the rectangle's own center, so this center is exact.
+      const center = {
+        x: rect.left - containerRect.left + rect.width / 2,
+        y: rect.top - containerRect.top + rect.height / 2,
       };
-    };
+      const size = { width: element.offsetWidth, height: element.offsetHeight };
+      const origin = { x: clientX - containerRect.left, y: clientY - containerRect.top };
 
-    const startDrag = (clientX: number, clientY: number) => {
-      if (!canDrag) return;
-      dragging.current = true;
+      // Rotation about the top-left corner turns about that corner; everything
+      // else pivots on the center.
+      const anchor = tool === InertiaTool.rotate
+        ? drawnPoint({ x: 0, y: 0 }, center, size, values)
+        : center;
+
+      start.current = {
+        anchor,
+        reference: { x: origin.x - anchor.x, y: origin.y - anchor.y },
+        origin,
+        values,
+        edit,
+        center,
+        size,
+      };
       moved.current = false;
-      offset.current = { x: clientX - pos.x, y: clientY - pos.y };
-      measure(pos);
     };
 
-    /// How far the node being dragged has moved from where layout put it, for
-    /// the editor's inspector.
-    ///
-    /// The accumulated drag, which is what `pos` already is — the same quantity
-    /// `stopDrag` normalizes into the translation, and what the SwiftUI runtime
-    /// sends as `totalOffset` and the Compose runtime as `dragOffset`. This used
-    /// to send the node's absolute top-left in the container's space instead, so
-    /// the one inspector readout meant two different things depending on which
-    /// runtime the app being authored was built on.
-    ///
-    /// Takes the position rather than reading `pos`: this is called from the
-    /// move handler, where the `setPos` for this event has not been applied yet,
-    /// so the state in scope is one event stale. The size comes from the
-    /// measurement taken when the gesture started, for the reason on `measure` —
-    /// `getBoundingClientRect` reports the transform the browser has painted,
-    /// which trails the drag by a frame.
-    const reportNodeProperties = (position: { x: number; y: number }) => {
+    /// What the editor is told: the values this node's schema starts it at with
+    /// everything the gestures have added folded in.
+    const authoredValues = (next: InertiaToolEdit) =>
+      applyToolEdit(initialValues ?? identityValues, next, inertiaCanvasSize ?? { width: 1, height: 1 });
+
+    const angleOf = (vector: { x: number; y: number }) =>
+      (Math.atan2(vector.y, vector.x) * 180) / Math.PI;
+
+    /// The edit this gesture has reached, given where the pointer is now.
+    const editAt = (point: { x: number; y: number }): InertiaToolEdit => {
+      const opening = start.current;
+      if (!opening) return edit;
+
+      const current = { x: point.x - opening.anchor.x, y: point.y - opening.anchor.y };
+
+      switch (tool) {
+        case InertiaTool.translate:
+          return {
+            ...opening.edit,
+            translate: [
+              opening.edit.translate[0] + (point.x - opening.origin.x),
+              opening.edit.translate[1] + (point.y - opening.origin.y),
+            ],
+          };
+
+        case InertiaTool.rotate:
+        case InertiaTool.rotateCenter: {
+          const swept = angleOf(current) - angleOf(opening.reference);
+          return tool === InertiaTool.rotate
+            ? { ...opening.edit, rotate: opening.edit.rotate + swept }
+            : { ...opening.edit, rotateCenter: opening.edit.rotateCenter + swept };
+        }
+
+        case InertiaTool.scale: {
+          const reference = Math.hypot(opening.reference.x, opening.reference.y);
+          if (!(reference > 1)) return opening.edit;
+
+          const factor = Math.hypot(current.x, current.y) / reference;
+          const scaled = Math.max(minimumToolScale, opening.values.scale * factor);
+          return { ...opening.edit, scale: opening.edit.scale + (scaled - opening.values.scale) };
+        }
+
+        case InertiaTool.opacity: {
+          // Measured along the track from where the gesture opened, so the knob
+          // tracks the pointer instead of jumping to it. The track as it is
+          // drawn — the pointer is in screen pixels, and the chrome is
+          // counter-scaled so a scaled-down node still gets a usable one.
+          const width = Math.max(opening.size.width * opening.values.scale, 60);
+          const travelled = (point.x - opening.origin.x) / (width > 0 ? width : 1);
+          const settled = Math.min(1, Math.max(0, opening.values.opacity + travelled));
+          return { ...opening.edit, opacity: opening.edit.opacity + (settled - opening.values.opacity) };
+        }
+      }
+    };
+
+    const doGesture = (clientX: number, clientY: number) => {
+      const opening = start.current;
+      if (!opening) return;
+
+      const point = inContainerSpace(clientX, clientY);
+      if (Math.abs(point.x - opening.origin.x) > 2 || Math.abs(point.y - opening.origin.y) > 2) {
+        moved.current = true;
+      }
+
+      const next = editAt(point);
+      setEdit(next);
+
+      const authored = authoredValues(next);
       manager.sendMessageSelectedNodeProperties({
-        positionX: position.x,
-        positionY: position.y,
-        sizeX: nodeSize.current.width,
-        sizeY: nodeSize.current.height,
+        positionX: authored.translate[0] * (inertiaCanvasSize?.width ?? 0),
+        positionY: authored.translate[1] * (inertiaCanvasSize?.height ?? 0),
+        sizeX: opening.size.width,
+        sizeY: opening.size.height,
+        values: authored,
       });
-    };
 
-    const doDrag = (clientX: number, clientY: number) => {
-      if (!dragging.current) return;
-      const dx = clientX - offset.current.x - pos.x;
-      const dy = clientY - offset.current.y - pos.y;
-      if (Math.abs(dx) > 2 || Math.abs(dy) > 2) moved.current = true;
-      const next = { x: clientX - offset.current.x, y: clientY - offset.current.y };
-      setPos(next);
-      reportNodeProperties(next);
+      // The guides box a node in as it is moved. They mean nothing for a
+      // rotation or an opacity, where the node stays where layout put it.
+      if (tool !== InertiaTool.translate) return;
+
+      const scale = opening.values.scale;
       guides?.show(
-        { x: baseCenter.current.x + next.x, y: baseCenter.current.y + next.y },
-        nodeSize.current
+        {
+          x: opening.center.x + (next.translate[0] - opening.edit.translate[0]),
+          y: opening.center.y + (next.translate[1] - opening.edit.translate[1]),
+        },
+        { width: opening.size.width * scale, height: opening.size.height * scale }
       );
     };
 
-    const stopDrag = () => {
-      if (dragging.current && actionableIdPairs && inertiaCanvasSize) {
-        manager.sendMessageTranslation({
+    /// Ends a gesture and hands the result to the editor to be written into the
+    /// schema. One message whatever the tool, carrying the whole transform: a
+    /// keyframe holds all five values, so the four this gesture did not touch
+    /// have to travel with the one it did.
+    const stopGesture = () => {
+      if (start.current && actionableIdPairs && inertiaCanvasSize) {
+        manager.sendMessageEdit({
+          tool,
+          values: authoredValues(edit),
           actionableIds: Array.from(actionableIdPairs),
-          translationX: pos.x / inertiaCanvasSize.width,
-          translationY: pos.y / inertiaCanvasSize.height,
         });
       }
-      dragging.current = false;
+      start.current = null;
       guides?.hide();
     };
 
     /// The switch is the editor's to flip and can go off mid-gesture, which the
-    /// pointer capture would otherwise ride straight through. The drag is
+    /// pointer capture would otherwise ride straight through. The gesture is
     /// dropped rather than committed — the editor has stopped taking edits — and
-    /// the node goes back to the position its schema puts it at, since the
-    /// translation it was being dragged towards is never going to be sent.
+    /// the node goes back to what its schema puts it at, since the edit it was
+    /// being dragged towards is never going to be sent.
     useEffect(() => {
-      if (canDrag || !dragging.current) return;
-      dragging.current = false;
+      if (canEdit || !start.current) return;
+      start.current = null;
       moved.current = false;
       guides?.hide();
-      setPos({ x: 0, y: 0 });
-    }, [canDrag]);
+      setEdit(noToolEdit);
+    }, [canEdit]);
+
+    /// Switching tools drops a gesture in progress too: it was opened against
+    /// the old tool's handle, and the property it was editing is not the one the
+    /// new tool would author.
+    useEffect(() => {
+      start.current = null;
+      guides?.hide();
+    }, [tool]);
+
+    /// Only while the node is editable — an app running without an editor
+    /// attached has no handles to size, and no reason to watch every actionable
+    /// for resizes.
+    useEffect(() => {
+      const element = containerRef.current;
+      if (!canEdit || !element) return;
+
+      // `offsetWidth`/`offsetHeight` are the laid-out box, which no transform
+      // touches — unlike the observer's own `contentRect`, which would report
+      // the node mid-scale while a scale handle is being dragged.
+      const measure = () => setLayoutBox({ width: element.offsetWidth, height: element.offsetHeight });
+      measure();
+
+      const observer = new ResizeObserver(measure);
+      observer.observe(element);
+
+      return () => observer.disconnect();
+    }, [canEdit, containerRef]);
 
     const handleClickCapture = (e: React.MouseEvent) => {
       if (moved.current) {
@@ -1215,41 +1649,53 @@ export function withDrag<T extends DraggableProps>(
       if (!moved.current) handleClick();
     };
 
-    const transformStyle = `translate(${pos.x}px, ${pos.y}px)`;
+    /// Whether this press landed on one of the active tool's knobs. The handles
+    /// are drawn deep inside the node, but the gesture is run from out here,
+    /// where the pointer capture lives — so the press is routed by what it hit
+    /// rather than by which element listens.
+    const isHandlePress = (target: EventTarget | null): boolean =>
+      target instanceof Element && target.closest(`[${HANDLE_ATTRIBUTE}]`) !== null;
+
+    const toolHandles = canEdit ? (
+      <InertiaToolHandles tool={tool} values={values} size={layoutBox} />
+    ) : null;
 
     return (
       <div
         onPointerDown={(e) => {
           e.stopPropagation();
-          if (canDrag) {
-            (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-            startDrag(e.clientX, e.clientY);
-          }
+          const onHandle = isHandlePress(e.target);
+          if (!canDragBody && !onHandle) return;
+
+          (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+          beginGesture(e.clientX, e.clientY);
+          // A press on a knob is never a click on the node. Without this,
+          // grabbing a handle and letting go without moving would fall through
+          // to the selection toggle and deselect the thing being edited.
+          if (onHandle) moved.current = true;
         }}
         onPointerMove={(e) => {
           e.stopPropagation();
-          doDrag(e.clientX, e.clientY);
+          doGesture(e.clientX, e.clientY);
         }}
         onPointerUp={(e) => {
           e.stopPropagation();
-          stopDrag();
+          stopGesture();
         }}
         // A gesture the browser takes away — a cancelled touch, a lost capture —
         // never reaches `onPointerUp`, and the grid would be left on screen.
         onPointerCancel={(e) => {
           e.stopPropagation();
-          stopDrag();
+          stopGesture();
         }}
         onClickCapture={handleClickCapture}
         onClick={handleClickToSelect}
         style={{
-          transform: transformStyle,
-          cursor: canDrag ? "grab" : "default",
+          cursor: canDragBody ? "grab" : "default",
           touchAction: "none",
-          willChange: "transform",
         }}
       >
-        <WrappedComponent {...props} moved={moved} />
+        <WrappedComponent {...props} moved={moved} toolHandles={toolHandles} />
       </div>
     );
   };
@@ -1495,7 +1941,7 @@ const InertiaShapeCanvas: React.FC<{
 };
 
 const InertiaGuts: React.FC<DraggableProps> = React.memo(
-  ({ hierarchyId, hierarchyIdPrefix, isSelected, containerRef, children, inertiaDataModel }) => {
+  ({ hierarchyId, hierarchyIdPrefix, isSelected, containerRef, children, inertiaDataModel, toolHandles }) => {
     const controller = useContext(InertiaPlaybackContext);
 
     // The controller writes this element's transform every frame it draws, so
@@ -1626,6 +2072,11 @@ const InertiaGuts: React.FC<DraggableProps> = React.memo(
             }}
           />
         )}
+
+        {/* Over the selection border, so a knob sitting on the edge is the thing
+            that gets grabbed. Inside this element, so the transform the
+            controller writes carries the chrome with the node. */}
+        {toolHandles}
       </div>
     );
   }
@@ -1646,7 +2097,7 @@ export const Inertia: React.FC<InertiaProps> = ({ children, id }) => {
   const indexManager = SharedIndexManager.shared;
   const containerRef = useRef<HTMLDivElement>(null);
 
-  const [pos, setPos] = useState({ x: 0, y: 0 });
+  const [edit, setEdit] = useState<InertiaToolEdit>(noToolEdit);
   /// This instance's own id: the authored id plus its index among its siblings.
   const [instanceId, setInstanceId] = useState<string>();
 
@@ -1664,27 +2115,34 @@ export const Inertia: React.FC<InertiaProps> = ({ children, id }) => {
     }
   }, [instanceId, inertiaParentId, inertiaIsContainer]);
 
-  /// The translation the schema starts this actionable at. The playback
-  /// controller writes it as the node's own transform, so `pos` — the drag that
-  /// sits on top of it — goes back to zero whenever it changes: by then the
-  /// gesture has been authored into the schema, and leaving it in place would
-  /// count the same move twice. It is also what returns a node to the origin
-  /// when the editor resets an animation's initial values.
+  /// The values the schema starts this actionable at. The playback controller
+  /// writes them as the node's own transform, so the edit that sits on top of
+  /// them goes back to nothing whenever they change: by then the gesture has
+  /// been authored into the schema, and leaving it in place would count the same
+  /// move twice. It is also what returns a node to the origin when the editor
+  /// resets an animation's initial values.
   ///
   /// Resolved by prefix, the way the controller resolves the schema it draws.
-  const initialTranslate = useMemo(() => {
+  const initialValues = useMemo(() => {
     if (!inertiaDataModel) return null;
 
     const animationId = inertiaDataModel.actionableIdToAnimationIdMap?.get(hierarchyIdPrefix) ?? hierarchyIdPrefix;
-    return inertiaDataModel.inertiaSchemas?.get(animationId)?.initialValues?.translate ?? null;
+    return inertiaDataModel.inertiaSchemas?.get(animationId)?.initialValues ?? null;
   }, [inertiaDataModel, hierarchyIdPrefix]);
 
   /// Keyed on the values themselves rather than on the data model: any other
-  /// update — a selection, say — would otherwise drop a drag the editor has not
-  /// been told about yet, snapping the node out from under the cursor.
+  /// update — a selection, say — would otherwise drop a gesture the editor has
+  /// not been told about yet, snapping the node out from under the cursor.
   useEffect(() => {
-    setPos({x: 0, y: 0});
-  }, [initialTranslate?.[0], initialTranslate?.[1]])
+    setEdit(noToolEdit);
+  }, [
+    initialValues?.translate?.[0],
+    initialValues?.translate?.[1],
+    initialValues?.rotate,
+    initialValues?.rotateCenter,
+    initialValues?.scale,
+    initialValues?.opacity,
+  ])
 
   const isSelected = instanceId ? Array.from(inertiaDataModel?.actionableIdPairs ?? []).some(pair => pair.hierarchyId === instanceId) : false;
 
@@ -1723,8 +2181,9 @@ export const Inertia: React.FC<InertiaProps> = ({ children, id }) => {
       children={children}
       inertiaDataModel={inertiaDataModel}
       actionableIdPairs={inertiaDataModel?.actionableIdPairs}
-      pos={pos}
-      setPos={setPos}
+      edit={edit}
+      setEdit={setEdit}
+      initialValues={initialValues ?? undefined}
     />
   );
 };
