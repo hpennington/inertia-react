@@ -150,6 +150,12 @@ type RegisteredNode = {
     /// from. The prefix is still the actionable it belongs to, which is what
     /// says whether that actionable has been triggered.
     schema?: InertiaAnimationSchema;
+    /// Whether this is a shape rather than an actionable, which decides what a
+    /// missing `schema` means. An actionable with no track of its own is drawn
+    /// from the one its prefix names; a shape is drawn from its own or from
+    /// nothing at all — the actionable's transform is already on the element
+    /// this one sits inside, and drawing it again here would apply it twice.
+    isShape?: boolean;
 };
 
 type ActionableState = {
@@ -312,13 +318,17 @@ export class InertiaPlaybackController {
     /// with the actionable it was authored behind rather than on a clock of its
     /// own. It is `hierarchyIdPrefix` that ties it to that actionable, and
     /// `schema` alone that says how it moves.
+    ///
+    /// A shape with no track registers too, when the editor has it selected: it
+    /// stays where it was authored, but a gesture on it still has to move it,
+    /// and this is what puts that gesture on screen. See `renderNode`.
     public registerShapeNode(
         id: string,
         hierarchyIdPrefix: string,
         element: HTMLElement,
-        schema: InertiaAnimationSchema
+        schema?: InertiaAnimationSchema
     ): void {
-        this.nodes.set(id, { hierarchyIdPrefix, element, schema });
+        this.nodes.set(id, { hierarchyIdPrefix, element, schema, isShape: true });
         this.renderNode(id);
     }
 
@@ -601,11 +611,13 @@ export class InertiaPlaybackController {
         }
 
         const edit = this.edits.get(hierarchyId) ?? null;
-        const schema = node.schema ?? this.schemas.get(node.hierarchyIdPrefix);
+        const schema = node.schema ?? (node.isShape ? undefined : this.schemas.get(node.hierarchyIdPrefix));
         if (!schema) {
             // Still drawn when the editor is dragging it: an actionable nobody
             // has animated yet has no schema until the first gesture is written
-            // into one, and it has to move under the cursor before then.
+            // into one, and it has to move under the cursor before then. Same
+            // for a shape authored as backdrop, which has no track until the
+            // first edit on it is written into one.
             if (!edit) {
                 this.renderedValues.delete(hierarchyId);
                 node.element.style.transform = "";
@@ -1525,11 +1537,436 @@ type ToolGestureStart = {
   /// into it.
   values: InertiaAnimationValuesBase;
   edit: InertiaToolEdit;
+  /// The transform this node was sitting inside when the gesture began. See
+  /// `ToolGestureOptions.outer`.
+  outer: InertiaAnimationValuesBase;
   /// The node's drawn center and laid-out size when the gesture began — what
   /// the guides are boxed against.
   center: { x: number; y: number };
   size: { width: number; height: number };
 };
+
+/// A drag measured on screen, restated in the space *inside* `outer` — which is
+/// where an offset stacked under it is measured.
+///
+/// A shape is moved by an offset applied within the actionable's own rotation
+/// and scale, so a drag to the right across a turned actionable is not a move to
+/// the right in the space the shape's offset lands in. Undoing the turn and the
+/// scale is what keeps the shape under the pointer. The Swift runtime's
+/// `InertiaAnimationValues.unapplying`, corner for corner.
+///
+/// Nothing to undo for an actionable, which sits inside the identity.
+const unapplyingOuter = (
+  delta: { x: number; y: number },
+  outer: InertiaAnimationValuesBase
+): { x: number; y: number } => {
+  const radians = (-(outer.rotate + outer.rotateCenter) * Math.PI) / 180;
+  const divisor = Number.isFinite(outer.scale) && Math.abs(outer.scale) > minimumToolScale
+    ? outer.scale
+    : 1;
+
+  return {
+    x: (delta.x * Math.cos(radians) - delta.y * Math.sin(radians)) / divisor,
+    y: (delta.x * Math.sin(radians) + delta.y * Math.cos(radians)) / divisor,
+  };
+};
+
+/// What a node hands `useToolGesture` in order to be dragged by the active tool.
+export type ToolGestureOptions = {
+  /// What the playback controller knows this node as: where the values it is
+  /// drawn at are read from, and where the gesture in progress is written back
+  /// to so the node moves under the cursor. Undefined until the node has an id,
+  /// which is a node that cannot be edited yet.
+  nodeId?: string;
+  /// The element the gesture measures. Its drawn box gives the center a
+  /// rotation turns about; its laid-out box is what the handles are placed
+  /// around.
+  elementRef: React.RefObject<HTMLElement | null>;
+  /// The values this node's schema starts it at, which an edit is measured from
+  /// and which the editor is told the total of.
+  initialValues?: InertiaAnimationValuesBase;
+  /// The transform this node is drawn inside of, when it is drawn inside one at
+  /// all: a shape sits within its actionable's, and an actionable sits within
+  /// nothing. Left out is the identity.
+  ///
+  /// Two things need it. The corner a rotation turns about is derived from the
+  /// measured center, and that derivation has to know the whole turn and scale
+  /// the node is painted with rather than only its own; and a move is authored
+  /// in the space *inside* this transform, which is not the space the pointer
+  /// was measured in. See `unapplyingOuter`.
+  outer?: InertiaAnimationValuesBase;
+  /// Whether this node is the editor's to drag right now.
+  canEdit: boolean;
+  /// Which property a gesture authors, as picked in the editor's toolbar.
+  tool: InertiaTool;
+  edit: InertiaToolEdit;
+  setEdit: React.Dispatch<React.SetStateAction<InertiaToolEdit>>;
+  /// Hands the settled gesture to the editor, as the values the schema should
+  /// be rewritten to. Whom the edit names is the caller's to say — an actionable
+  /// sends the whole selection, a shape sends its own id.
+  commit: (values: InertiaAnimationValuesBase) => void;
+  /// Whether the editor's inspector is told where this node is as it moves.
+  /// An actionable reports; a shape does not, matching the Swift runtime, where
+  /// the properties message is the actionable's to send and a shape's gesture
+  /// only records an edit.
+  reportsProperties?: boolean;
+};
+
+/// One node's drag: the pointer handling, the tool math, and the chrome's
+/// measurements.
+///
+/// Shared by the actionables — through `withDrag`, which is nothing more than
+/// this hook wrapped around a component — and by the shapes drawn behind them,
+/// which are dragged by exactly the same tools and report exactly the same
+/// edit. The two differ only in what they are measured against and in whom the
+/// resulting edit names, which is what `ToolGestureOptions` carries.
+export function useToolGesture({
+  nodeId,
+  elementRef,
+  initialValues,
+  outer = identityValues,
+  canEdit,
+  tool,
+  edit,
+  setEdit,
+  commit,
+  reportsProperties = false,
+}: ToolGestureOptions) {
+  /// The whole node is the handle for the move tool, and only for it. Every
+  /// other tool edits through its knobs, so a drag across the body of a node
+  /// does nothing — the way a modal tool behaves in any other editor.
+  const canDragBody = canEdit && tool === InertiaTool.translate;
+
+  const start = useRef<ToolGestureStart | null>(null);
+  const moved = useRef(false);
+  /// The node's laid-out box, which is what the handles are placed around.
+  /// Measured into state rather than read off the ref while rendering: a ref
+  /// read is not reactive, so handles would keep the size the node had when
+  /// something else last happened to re-render it.
+  const [layoutBox, setLayoutBox] = useState({ width: 0, height: 0 });
+
+  const inertiaCanvasSize = useContext(InertiaCanvasSizeContext);
+  const inertiaContainerRef = useContext(InertiaContainerElementContext);
+  const guides = useContext(InertiaGuidesContext);
+  const controller = useContext(InertiaPlaybackContext);
+
+  /// The node as it is drawn right now, gesture included — read from the
+  /// controller, which is what put it there.
+  const values = nodeId && controller ? controller.valuesFor(nodeId) : identityValues;
+
+  /// Drawn by the controller in the same matrix as the schema, rather than as
+  /// a transform on this wrapper: what the editor is sent is a single set of
+  /// values, and stacking two transforms would not be the same transform.
+  React.useLayoutEffect(() => {
+    if (!controller || !nodeId) return;
+    controller.setEdit(nodeId, canEdit ? edit : null);
+  }, [controller, nodeId, edit, canEdit]);
+
+  /// Where a point of the node's own laid-out box — origin at its top-left —
+  /// is drawn in the container.
+  ///
+  /// Every transform in the stack is affine and all of them but the offset
+  /// pivot somewhere inside the box, so the drawn box is the laid-out box
+  /// scaled and turned about its own drawn center. That center is measured
+  /// rather than derived, which keeps this honest whatever the page's layout
+  /// has done with the node.
+  const drawnPoint = (
+    local: { x: number; y: number },
+    center: { x: number; y: number },
+    size: { width: number; height: number },
+    at: InertiaAnimationValuesBase
+  ) => {
+    const radians = ((at.rotate + at.rotateCenter) * Math.PI) / 180;
+    const dx = (local.x - size.width / 2) * at.scale;
+    const dy = (local.y - size.height / 2) * at.scale;
+
+    return {
+      x: center.x + dx * Math.cos(radians) - dy * Math.sin(radians),
+      y: center.y + dx * Math.sin(radians) + dy * Math.cos(radians),
+    };
+  };
+
+  /// The pointer in the container's space. Measured there rather than in the
+  /// node's own: the node is being moved by the very gesture being measured,
+  /// and its coordinates move with it.
+  const inContainerSpace = (clientX: number, clientY: number) => {
+    const container = inertiaContainerRef?.current;
+    if (!container) return { x: clientX, y: clientY };
+
+    const rect = container.getBoundingClientRect();
+    return { x: clientX - rect.left, y: clientY - rect.top };
+  };
+
+  const beginGesture = (
+    clientX: number,
+    clientY: number,
+    axis: InertiaTranslateAxis | null
+  ) => {
+    const element = elementRef.current;
+    const container = inertiaContainerRef?.current;
+    if (!element || !container) return;
+
+    const rect = element.getBoundingClientRect();
+    const containerRect = container.getBoundingClientRect();
+
+    // `getBoundingClientRect` reports what the browser has painted, so this is
+    // the drawn box; `offsetWidth`/`offsetHeight` are the laid-out one, which
+    // no transform touches. A rotated rectangle's bounding box is symmetric
+    // about the rectangle's own center, so this center is exact.
+    const center = {
+      x: rect.left - containerRect.left + rect.width / 2,
+      y: rect.top - containerRect.top + rect.height / 2,
+    };
+    const size = { width: element.offsetWidth, height: element.offsetHeight };
+    const origin = { x: clientX - containerRect.left, y: clientY - containerRect.top };
+
+    // Rotation about the top-left corner turns about that corner; everything
+    // else pivots on the center. The corner is walked out from the measured
+    // center through everything the node is painted with — its own transform
+    // and whatever it is drawn inside of — since that is the box the corner is
+    // a corner of.
+    const anchor = tool === InertiaTool.rotate
+      ? drawnPoint({ x: 0, y: 0 }, center, size, {
+          ...values,
+          rotate: values.rotate + outer.rotate,
+          rotateCenter: values.rotateCenter + outer.rotateCenter,
+          scale: values.scale * outer.scale,
+        })
+      : center;
+
+    start.current = {
+      anchor,
+      reference: { x: origin.x - anchor.x, y: origin.y - anchor.y },
+      origin,
+      axis,
+      values,
+      edit,
+      outer,
+      center,
+      size,
+    };
+    moved.current = false;
+  };
+
+  /// What the editor is told: the values this node's schema starts it at with
+  /// everything the gestures have added folded in.
+  const authoredValues = (next: InertiaToolEdit) =>
+    applyToolEdit(initialValues ?? identityValues, next, inertiaCanvasSize ?? { width: 1, height: 1 });
+
+  const angleOf = (vector: { x: number; y: number }) =>
+    (Math.atan2(vector.y, vector.x) * 180) / Math.PI;
+
+  /// The edit this gesture has reached, given where the pointer is now.
+  const editAt = (point: { x: number; y: number }): InertiaToolEdit => {
+    const opening = start.current;
+    if (!opening) return edit;
+
+    const current = { x: point.x - opening.anchor.x, y: point.y - opening.anchor.y };
+
+    switch (tool) {
+      case InertiaTool.translate: {
+        // The body of the node moves freely; an axis arrow authors only its own
+        // component of the same drag. Constrained on screen, where the arrows
+        // are — they are counter-rotated out of whatever the node has been
+        // turned by — and carried into the node's own space afterwards.
+        const delta = unapplyingOuter(
+          constrainToAxis(opening.axis, {
+            x: point.x - opening.origin.x,
+            y: point.y - opening.origin.y,
+          }),
+          opening.outer
+        );
+
+        return {
+          ...opening.edit,
+          translate: [
+            opening.edit.translate[0] + delta.x,
+            opening.edit.translate[1] + delta.y,
+          ],
+        };
+      }
+
+      case InertiaTool.rotate:
+      case InertiaTool.rotateCenter: {
+        const swept = angleOf(current) - angleOf(opening.reference);
+        return tool === InertiaTool.rotate
+          ? { ...opening.edit, rotate: opening.edit.rotate + swept }
+          : { ...opening.edit, rotateCenter: opening.edit.rotateCenter + swept };
+      }
+
+      case InertiaTool.scale: {
+        const reference = Math.hypot(opening.reference.x, opening.reference.y);
+        if (!(reference > 1)) return opening.edit;
+
+        const factor = Math.hypot(current.x, current.y) / reference;
+        const scaled = Math.max(minimumToolScale, opening.values.scale * factor);
+        return { ...opening.edit, scale: opening.edit.scale + (scaled - opening.values.scale) };
+      }
+
+      case InertiaTool.opacity: {
+        // Measured along the track from where the gesture opened, so the knob
+        // tracks the pointer instead of jumping to it. The track as it is
+        // drawn — the pointer is in screen pixels, and the chrome is
+        // counter-scaled so a scaled-down node still gets a usable one.
+        const width = Math.max(opening.size.width * opening.values.scale * opening.outer.scale, 60);
+        const travelled = (point.x - opening.origin.x) / (width > 0 ? width : 1);
+        const settled = Math.min(1, Math.max(0, opening.values.opacity + travelled));
+        return { ...opening.edit, opacity: opening.edit.opacity + (settled - opening.values.opacity) };
+      }
+    }
+  };
+
+  const doGesture = (clientX: number, clientY: number) => {
+    const opening = start.current;
+    if (!opening) return;
+
+    const point = inContainerSpace(clientX, clientY);
+    if (Math.abs(point.x - opening.origin.x) > 2 || Math.abs(point.y - opening.origin.y) > 2) {
+      moved.current = true;
+    }
+
+    const next = editAt(point);
+    setEdit(next);
+
+    if (reportsProperties) {
+      const authored = authoredValues(next);
+      manager.sendMessageSelectedNodeProperties({
+        positionX: authored.translate[0] * (inertiaCanvasSize?.width ?? 0),
+        positionY: authored.translate[1] * (inertiaCanvasSize?.height ?? 0),
+        sizeX: opening.size.width,
+        sizeY: opening.size.height,
+        values: authored,
+      });
+    }
+
+    // The guides box a node in as it is moved. They mean nothing for a
+    // rotation or an opacity, where the node stays where layout put it.
+    if (tool !== InertiaTool.translate) return;
+
+    // Boxed on screen, from the drag as the screen saw it: the edit this gesture
+    // authored is measured inside whatever the node is drawn within, which is
+    // not the space the guides are drawn in.
+    const moveOnScreen = constrainToAxis(opening.axis, {
+      x: point.x - opening.origin.x,
+      y: point.y - opening.origin.y,
+    });
+    const scale = opening.values.scale * opening.outer.scale;
+    guides?.show(
+      {
+        x: opening.center.x + moveOnScreen.x,
+        y: opening.center.y + moveOnScreen.y,
+      },
+      { width: opening.size.width * scale, height: opening.size.height * scale }
+    );
+  };
+
+  /// Ends a gesture and hands the result to the editor to be written into the
+  /// schema. One message whatever the tool, carrying the whole transform: a
+  /// keyframe holds all five values, so the four this gesture did not touch
+  /// have to travel with the one it did.
+  const stopGesture = () => {
+    if (start.current && inertiaCanvasSize) {
+      commit(authoredValues(edit));
+    }
+    start.current = null;
+    guides?.hide();
+  };
+
+  /// The switch is the editor's to flip and can go off mid-gesture, which the
+  /// pointer capture would otherwise ride straight through. The gesture is
+  /// dropped rather than committed — the editor has stopped taking edits — and
+  /// the node goes back to what its schema puts it at, since the edit it was
+  /// being dragged towards is never going to be sent.
+  useEffect(() => {
+    if (canEdit || !start.current) return;
+    start.current = null;
+    moved.current = false;
+    guides?.hide();
+    setEdit(noToolEdit);
+  }, [canEdit]);
+
+  /// Switching tools drops a gesture in progress too: it was opened against
+  /// the old tool's handle, and the property it was editing is not the one the
+  /// new tool would author.
+  useEffect(() => {
+    start.current = null;
+    guides?.hide();
+  }, [tool]);
+
+  /// Only while the node is editable — an app running without an editor
+  /// attached has no handles to size, and no reason to watch every actionable
+  /// for resizes.
+  useEffect(() => {
+    const element = elementRef.current;
+    if (!canEdit || !element) return;
+
+    // `offsetWidth`/`offsetHeight` are the laid-out box, which no transform
+    // touches — unlike the observer's own `contentRect`, which would report
+    // the node mid-scale while a scale handle is being dragged.
+    const measure = () => setLayoutBox({ width: element.offsetWidth, height: element.offsetHeight });
+    measure();
+
+    const observer = new ResizeObserver(measure);
+    observer.observe(element);
+
+    return () => observer.disconnect();
+  }, [canEdit, elementRef]);
+
+  /// Which of the active tool's knobs this press landed on, if any. The handles
+  /// are drawn deep inside the node, but the gesture is run from out here,
+  /// where the pointer capture lives — so the press is routed by what it hit
+  /// rather than by which element listens.
+  const handleAt = (target: EventTarget | null): string | null =>
+    target instanceof Element
+      ? target.closest(`[${HANDLE_ATTRIBUTE}]`)?.getAttribute(HANDLE_ATTRIBUTE) ?? null
+      : null;
+
+  /// Everything the element taking the pointer capture has to listen for.
+  /// Spread onto it, so the one that hears the press is the one that owns the
+  /// gesture.
+  const pointerHandlers = {
+    onPointerDown: (e: React.PointerEvent) => {
+      e.stopPropagation();
+      const handle = handleAt(e.target);
+      const onHandle = handle !== null;
+      if (!canDragBody && !onHandle) return;
+
+      (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+      beginGesture(e.clientX, e.clientY, axisFromHandle(handle));
+      // A press on a knob is never a click on the node. Without this,
+      // grabbing a handle and letting go without moving would fall through
+      // to the selection toggle and deselect the thing being edited.
+      if (onHandle) moved.current = true;
+    },
+    onPointerMove: (e: React.PointerEvent) => {
+      e.stopPropagation();
+      doGesture(e.clientX, e.clientY);
+    },
+    onPointerUp: (e: React.PointerEvent) => {
+      e.stopPropagation();
+      stopGesture();
+    },
+    // A gesture the browser takes away — a cancelled touch, a lost capture —
+    // never reaches `onPointerUp`, and the grid would be left on screen.
+    onPointerCancel: (e: React.PointerEvent) => {
+      e.stopPropagation();
+      stopGesture();
+    },
+    onClickCapture: (e: React.MouseEvent) => {
+      if (moved.current) {
+        e.stopPropagation();
+        e.preventDefault();
+      }
+    },
+  };
+
+  /// The chrome for the active tool, sized to this node's laid-out box.
+  const toolHandles = canEdit ? (
+    <InertiaToolHandles tool={tool} values={values} size={layoutBox} />
+  ) : null;
+
+  return { values, layoutBox, moved, canDragBody, pointerHandlers, toolHandles };
+}
 
 export function withDrag<T extends DraggableProps>(
   WrappedComponent: React.ComponentType<T & Partial<DraggableInjectedProps>>
@@ -1544,273 +1981,34 @@ export function withDrag<T extends DraggableProps>(
     /// pair of conditions the Swift and Compose runtimes gate their gestures on.
     const canEdit = isSelected && (inertiaDataModel?.isActionable ?? false);
     const tool = inertiaDataModel?.activeTool ?? InertiaTool.translate;
-    /// The whole node is the handle for the move tool, and only for it. Every
-    /// other tool edits through its knobs, so a drag across the body of a node
-    /// does nothing — the way a modal tool behaves in any other editor.
-    const canDragBody = canEdit && tool === InertiaTool.translate;
-
-    const start = useRef<ToolGestureStart | null>(null);
-    const moved = useRef(false);
-    /// The node's laid-out box, which is what the handles are placed around.
-    /// Measured into state rather than read off the ref while rendering: a ref
-    /// read is not reactive, so handles would keep the size the node had when
-    /// something else last happened to re-render it.
-    const [layoutBox, setLayoutBox] = useState({ width: 0, height: 0 });
 
     const inertiaCanvasSize = useContext(InertiaCanvasSizeContext);
-    const inertiaContainerRef = useContext(InertiaContainerElementContext);
-    const guides = useContext(InertiaGuidesContext);
-    const controller = useContext(InertiaPlaybackContext);
 
-    /// The node as it is drawn right now, gesture included — read from the
-    /// controller, which is what put it there.
-    const values = hierarchyId && controller ? controller.valuesFor(hierarchyId) : identityValues;
-
-    /// Drawn by the controller in the same matrix as the schema, rather than as
-    /// a transform on this wrapper: what the editor is sent is a single set of
-    /// values, and stacking two transforms would not be the same transform.
-    React.useLayoutEffect(() => {
-      if (!controller || !hierarchyId) return;
-      controller.setEdit(hierarchyId, canEdit ? edit : null);
-    }, [controller, hierarchyId, edit, canEdit]);
-
-    /// Where a point of the node's own laid-out box — origin at its top-left —
-    /// is drawn in the container.
-    ///
-    /// Every transform in the stack is affine and all of them but the offset
-    /// pivot somewhere inside the box, so the drawn box is the laid-out box
-    /// scaled and turned about its own drawn center. That center is measured
-    /// rather than derived, which keeps this honest whatever the page's layout
-    /// has done with the node.
-    const drawnPoint = (
-      local: { x: number; y: number },
-      center: { x: number; y: number },
-      size: { width: number; height: number },
-      at: InertiaAnimationValuesBase
-    ) => {
-      const radians = ((at.rotate + at.rotateCenter) * Math.PI) / 180;
-      const dx = (local.x - size.width / 2) * at.scale;
-      const dy = (local.y - size.height / 2) * at.scale;
-
-      return {
-        x: center.x + dx * Math.cos(radians) - dy * Math.sin(radians),
-        y: center.y + dx * Math.sin(radians) + dy * Math.cos(radians),
-      };
-    };
-
-    /// The pointer in the container's space. Measured there rather than in the
-    /// node's own: the node is being moved by the very gesture being measured,
-    /// and its coordinates move with it.
-    const inContainerSpace = (clientX: number, clientY: number) => {
-      const container = inertiaContainerRef?.current;
-      if (!container) return { x: clientX, y: clientY };
-
-      const rect = container.getBoundingClientRect();
-      return { x: clientX - rect.left, y: clientY - rect.top };
-    };
-
-    const beginGesture = (
-      clientX: number,
-      clientY: number,
-      axis: InertiaTranslateAxis | null
-    ) => {
-      const element = containerRef.current;
-      const container = inertiaContainerRef?.current;
-      if (!element || !container) return;
-
-      const rect = element.getBoundingClientRect();
-      const containerRect = container.getBoundingClientRect();
-
-      // `getBoundingClientRect` reports what the browser has painted, so this is
-      // the drawn box; `offsetWidth`/`offsetHeight` are the laid-out one, which
-      // no transform touches. A rotated rectangle's bounding box is symmetric
-      // about the rectangle's own center, so this center is exact.
-      const center = {
-        x: rect.left - containerRect.left + rect.width / 2,
-        y: rect.top - containerRect.top + rect.height / 2,
-      };
-      const size = { width: element.offsetWidth, height: element.offsetHeight };
-      const origin = { x: clientX - containerRect.left, y: clientY - containerRect.top };
-
-      // Rotation about the top-left corner turns about that corner; everything
-      // else pivots on the center.
-      const anchor = tool === InertiaTool.rotate
-        ? drawnPoint({ x: 0, y: 0 }, center, size, values)
-        : center;
-
-      start.current = {
-        anchor,
-        reference: { x: origin.x - anchor.x, y: origin.y - anchor.y },
-        origin,
-        axis,
-        values,
-        edit,
-        center,
-        size,
-      };
-      moved.current = false;
-    };
-
-    /// What the editor is told: the values this node's schema starts it at with
-    /// everything the gestures have added folded in.
-    const authoredValues = (next: InertiaToolEdit) =>
-      applyToolEdit(initialValues ?? identityValues, next, inertiaCanvasSize ?? { width: 1, height: 1 });
-
-    const angleOf = (vector: { x: number; y: number }) =>
-      (Math.atan2(vector.y, vector.x) * 180) / Math.PI;
-
-    /// The edit this gesture has reached, given where the pointer is now.
-    const editAt = (point: { x: number; y: number }): InertiaToolEdit => {
-      const opening = start.current;
-      if (!opening) return edit;
-
-      const current = { x: point.x - opening.anchor.x, y: point.y - opening.anchor.y };
-
-      switch (tool) {
-        case InertiaTool.translate: {
-          // The body of the node moves freely; an axis arrow authors only its own
-          // component of the same drag.
-          const delta = constrainToAxis(opening.axis, {
-            x: point.x - opening.origin.x,
-            y: point.y - opening.origin.y,
-          });
-
-          return {
-            ...opening.edit,
-            translate: [
-              opening.edit.translate[0] + delta.x,
-              opening.edit.translate[1] + delta.y,
-            ],
-          };
-        }
-
-        case InertiaTool.rotate:
-        case InertiaTool.rotateCenter: {
-          const swept = angleOf(current) - angleOf(opening.reference);
-          return tool === InertiaTool.rotate
-            ? { ...opening.edit, rotate: opening.edit.rotate + swept }
-            : { ...opening.edit, rotateCenter: opening.edit.rotateCenter + swept };
-        }
-
-        case InertiaTool.scale: {
-          const reference = Math.hypot(opening.reference.x, opening.reference.y);
-          if (!(reference > 1)) return opening.edit;
-
-          const factor = Math.hypot(current.x, current.y) / reference;
-          const scaled = Math.max(minimumToolScale, opening.values.scale * factor);
-          return { ...opening.edit, scale: opening.edit.scale + (scaled - opening.values.scale) };
-        }
-
-        case InertiaTool.opacity: {
-          // Measured along the track from where the gesture opened, so the knob
-          // tracks the pointer instead of jumping to it. The track as it is
-          // drawn — the pointer is in screen pixels, and the chrome is
-          // counter-scaled so a scaled-down node still gets a usable one.
-          const width = Math.max(opening.size.width * opening.values.scale, 60);
-          const travelled = (point.x - opening.origin.x) / (width > 0 ? width : 1);
-          const settled = Math.min(1, Math.max(0, opening.values.opacity + travelled));
-          return { ...opening.edit, opacity: opening.edit.opacity + (settled - opening.values.opacity) };
-        }
-      }
-    };
-
-    const doGesture = (clientX: number, clientY: number) => {
-      const opening = start.current;
-      if (!opening) return;
-
-      const point = inContainerSpace(clientX, clientY);
-      if (Math.abs(point.x - opening.origin.x) > 2 || Math.abs(point.y - opening.origin.y) > 2) {
-        moved.current = true;
-      }
-
-      const next = editAt(point);
-      setEdit(next);
-
-      const authored = authoredValues(next);
-      manager.sendMessageSelectedNodeProperties({
-        positionX: authored.translate[0] * (inertiaCanvasSize?.width ?? 0),
-        positionY: authored.translate[1] * (inertiaCanvasSize?.height ?? 0),
-        sizeX: opening.size.width,
-        sizeY: opening.size.height,
-        values: authored,
-      });
-
-      // The guides box a node in as it is moved. They mean nothing for a
-      // rotation or an opacity, where the node stays where layout put it.
-      if (tool !== InertiaTool.translate) return;
-
-      const scale = opening.values.scale;
-      guides?.show(
-        {
-          x: opening.center.x + (next.translate[0] - opening.edit.translate[0]),
-          y: opening.center.y + (next.translate[1] - opening.edit.translate[1]),
-        },
-        { width: opening.size.width * scale, height: opening.size.height * scale }
-      );
-    };
-
-    /// Ends a gesture and hands the result to the editor to be written into the
-    /// schema. One message whatever the tool, carrying the whole transform: a
+    /// One `MessageEdit` whatever the tool, carrying the whole transform: a
     /// keyframe holds all five values, so the four this gesture did not touch
-    /// have to travel with the one it did.
-    const stopGesture = () => {
-      if (start.current && actionableIdPairs && inertiaCanvasSize) {
-        manager.sendMessageEdit({
-          tool,
-          values: authoredValues(edit),
-          actionableIds: Array.from(actionableIdPairs),
-        });
-      }
-      start.current = null;
-      guides?.hide();
+    /// have to travel with the one it did. Named for the whole selection, since
+    /// an actionable is dragged as one of however many the editor has picked.
+    const commit = (values: InertiaAnimationValuesBase) => {
+      if (!actionableIdPairs || !inertiaCanvasSize) return;
+
+      manager.sendMessageEdit({
+        tool,
+        values,
+        actionableIds: Array.from(actionableIdPairs),
+      });
     };
 
-    /// The switch is the editor's to flip and can go off mid-gesture, which the
-    /// pointer capture would otherwise ride straight through. The gesture is
-    /// dropped rather than committed — the editor has stopped taking edits — and
-    /// the node goes back to what its schema puts it at, since the edit it was
-    /// being dragged towards is never going to be sent.
-    useEffect(() => {
-      if (canEdit || !start.current) return;
-      start.current = null;
-      moved.current = false;
-      guides?.hide();
-      setEdit(noToolEdit);
-    }, [canEdit]);
-
-    /// Switching tools drops a gesture in progress too: it was opened against
-    /// the old tool's handle, and the property it was editing is not the one the
-    /// new tool would author.
-    useEffect(() => {
-      start.current = null;
-      guides?.hide();
-    }, [tool]);
-
-    /// Only while the node is editable — an app running without an editor
-    /// attached has no handles to size, and no reason to watch every actionable
-    /// for resizes.
-    useEffect(() => {
-      const element = containerRef.current;
-      if (!canEdit || !element) return;
-
-      // `offsetWidth`/`offsetHeight` are the laid-out box, which no transform
-      // touches — unlike the observer's own `contentRect`, which would report
-      // the node mid-scale while a scale handle is being dragged.
-      const measure = () => setLayoutBox({ width: element.offsetWidth, height: element.offsetHeight });
-      measure();
-
-      const observer = new ResizeObserver(measure);
-      observer.observe(element);
-
-      return () => observer.disconnect();
-    }, [canEdit, containerRef]);
-
-    const handleClickCapture = (e: React.MouseEvent) => {
-      if (moved.current) {
-        e.stopPropagation();
-        e.preventDefault();
-      }
-    };
+    const { moved, canDragBody, pointerHandlers, toolHandles } = useToolGesture({
+      nodeId: hierarchyId,
+      elementRef: containerRef,
+      initialValues,
+      canEdit,
+      tool,
+      edit,
+      setEdit,
+      commit,
+      reportsProperties: true,
+    });
 
     /// The click that ends a gesture is dispatched at whichever element held the
     /// pointer capture, not at the element under the cursor — so while a node is
@@ -1821,49 +2019,9 @@ export function withDrag<T extends DraggableProps>(
       if (!moved.current) handleClick();
     };
 
-    /// Which of the active tool's knobs this press landed on, if any. The handles
-    /// are drawn deep inside the node, but the gesture is run from out here,
-    /// where the pointer capture lives — so the press is routed by what it hit
-    /// rather than by which element listens.
-    const handleAt = (target: EventTarget | null): string | null =>
-      target instanceof Element
-        ? target.closest(`[${HANDLE_ATTRIBUTE}]`)?.getAttribute(HANDLE_ATTRIBUTE) ?? null
-        : null;
-
-    const toolHandles = canEdit ? (
-      <InertiaToolHandles tool={tool} values={values} size={layoutBox} />
-    ) : null;
-
     return (
       <div
-        onPointerDown={(e) => {
-          e.stopPropagation();
-          const handle = handleAt(e.target);
-          const onHandle = handle !== null;
-          if (!canDragBody && !onHandle) return;
-
-          (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-          beginGesture(e.clientX, e.clientY, axisFromHandle(handle));
-          // A press on a knob is never a click on the node. Without this,
-          // grabbing a handle and letting go without moving would fall through
-          // to the selection toggle and deselect the thing being edited.
-          if (onHandle) moved.current = true;
-        }}
-        onPointerMove={(e) => {
-          e.stopPropagation();
-          doGesture(e.clientX, e.clientY);
-        }}
-        onPointerUp={(e) => {
-          e.stopPropagation();
-          stopGesture();
-        }}
-        // A gesture the browser takes away — a cancelled touch, a lost capture —
-        // never reaches `onPointerUp`, and the grid would be left on screen.
-        onPointerCancel={(e) => {
-          e.stopPropagation();
-          stopGesture();
-        }}
-        onClickCapture={handleClickCapture}
+        {...pointerHandlers}
         onClick={handleClickToSelect}
         style={{
           cursor: canDragBody ? "grab" : "default",
@@ -1968,27 +2126,46 @@ function layoutSizeOf(element: HTMLElement): InertiaCanvasSize {
 /// writes that track's transform onto this canvas element every frame — the
 /// same way it moves an actionable, and stacked on top of the actionable's own
 /// transform because this element sits inside it.
+///
+/// A canvas the editor has selected is registered whether or not it was given a
+/// track, since a gesture on it has to move it before there is any track to move
+/// it by — see `InertiaPlaybackController.registerShapeNode`.
 const InertiaShapeCanvas: React.FC<{
     shapes: Array<InertiaShape>;
     actionableSize: InertiaCanvasSize;
     animation?: InertiaAnimationSchema;
     nodeId?: string;
     hierarchyIdPrefix?: string;
-}> = ({ shapes, actionableSize, animation, nodeId, hierarchyIdPrefix }) => {
+    /// The instance this canvas is drawn inside of, whose transform the shape's
+    /// own is stacked on top of. What a selected shape's gestures are measured
+    /// against — see `ToolGestureOptions.outer`.
+    actionableId?: string;
+    /// The one shape on this canvas, when the editor has picked it. Selection
+    /// is what gives a shape a canvas to itself, so there is never more than
+    /// one — see `InertiaGuts`.
+    selected?: InertiaShape;
+}> = ({ shapes, actionableSize, animation, nodeId, hierarchyIdPrefix, actionableId, selected }) => {
+    /// What the controller writes the transform to, and what the chrome is
+    /// placed inside: the canvas cannot hold the border and the handles, since a
+    /// `<canvas>` has no children.
+    const boxRef = useRef<HTMLDivElement>(null);
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const glRef = useRef<{ gl: WebGLRenderingContext; program: WebGLProgram; buffer: WebGLBuffer } | null>(null);
     const controller = useContext(InertiaPlaybackContext);
 
     useEffect(() => {
-        const canvas = canvasRef.current;
-        if (!canvas || !controller || !animation || !nodeId || !hierarchyIdPrefix) {
+        const box = boxRef.current;
+        if (!box || !controller || !nodeId || !hierarchyIdPrefix) {
+            return;
+        }
+        if (!animation && !selected) {
             return;
         }
 
-        controller.registerShapeNode(nodeId, hierarchyIdPrefix, canvas, animation);
+        controller.registerShapeNode(nodeId, hierarchyIdPrefix, box, animation);
 
         return () => controller.unregisterNode(nodeId);
-    }, [controller, animation, nodeId, hierarchyIdPrefix]);
+    }, [controller, animation, nodeId, hierarchyIdPrefix, !!selected]);
 
     /// The canvas's own box, in multiples of the actionable.
     const bounds = useMemo(() => shapeBounds(shapes), [shapes]);
@@ -2092,15 +2269,18 @@ const InertiaShapeCanvas: React.FC<{
     if (!box) return null;
 
     return (
-        <canvas
-            ref={canvasRef}
+        <div
+            ref={boxRef}
             style={{
                 position: "absolute",
                 left: box.left,
                 top: box.top,
                 width: box.width,
                 height: box.height,
-                pointerEvents: "none",
+                // A selected shape is dragged by its own box, so that box has to
+                // be able to hear a press. Everything else here is backdrop, and
+                // would otherwise swallow taps meant for the views it overlaps.
+                pointerEvents: selected ? "auto" : "none",
                 // Being first in the DOM is not enough to paint first: a
                 // positioned element paints above its in-flow siblings whatever
                 // order they are written in, so the canvas was drawing *over*
@@ -2108,10 +2288,143 @@ const InertiaShapeCanvas: React.FC<{
                 // Negative z-index drops it below the in-flow content while
                 // staying above the actionable's own background, which is what
                 // a backdrop is. It relies on the actionable isolating itself;
-                // see the wrapper below.
+                // see the wrapper below. The selection chrome is inside this, so
+                // it stays behind the app's own content too — a shape is drawn
+                // behind the views, and it is picked in the hierarchy panel
+                // rather than out here.
                 zIndex: -1
             }}
-        />
+        >
+            <canvas
+                ref={canvasRef}
+                style={{
+                    position: "absolute",
+                    left: 0,
+                    top: 0,
+                    width: box.width,
+                    height: box.height,
+                    pointerEvents: "none"
+                }}
+            />
+
+            {selected && nodeId && hierarchyIdPrefix && (
+                <InertiaShapeChrome
+                    shape={selected}
+                    nodeId={nodeId}
+                    hierarchyIdPrefix={hierarchyIdPrefix}
+                    actionableId={actionableId}
+                    boxRef={boxRef}
+                />
+            )}
+        </div>
+    );
+};
+
+/// The border and handles a selected shape grows, and the gesture that drags it.
+///
+/// The same chrome an actionable shows and the same tools, because a shape is
+/// edited exactly as a view is: one palette, one gesture, one `MessageEdit`.
+/// What differs is only what the edit names — the shape's own id under the
+/// schema that carries it, which is exactly how it was selected — and what it is
+/// measured from, which is the track the shape carries rather than the
+/// actionable's.
+///
+/// None of the outer geometry the Swift runtime needs applies here. The box this
+/// sits in is measured with `getBoundingClientRect`, which reports what the
+/// browser painted — the actionable's transform and the shape's own already
+/// composed — so the gesture math has nothing left to unwind.
+const InertiaShapeChrome: React.FC<{
+    shape: InertiaShape;
+    /// What the playback controller knows this shape's canvas as.
+    nodeId: string;
+    /// The actionable carrying the schema this shape was authored in, which is
+    /// the prefix half of the pair an edit names it by.
+    hierarchyIdPrefix: string;
+    /// The instance this shape is drawn inside of.
+    actionableId?: string;
+    boxRef: React.RefObject<HTMLDivElement>;
+}> = ({ shape, nodeId, hierarchyIdPrefix, actionableId, boxRef }) => {
+    const { inertiaDataModel } = useContext(InertiaContext)!;
+    const inertiaCanvasSize = useContext(InertiaCanvasSizeContext);
+    const controller = useContext(InertiaPlaybackContext);
+
+    const tool = inertiaDataModel?.activeTool ?? InertiaTool.translate;
+
+    /// Everything this shape's gestures have added on top of its track, still
+    /// waiting for the editor to fold them in.
+    const [edit, setEdit] = useState<InertiaToolEdit>(noToolEdit);
+
+    /// The values the shape's own track starts it at. A shape authored as
+    /// backdrop has no track and so starts at the identity, which is where the
+    /// editor writes the first edit on it from.
+    const initialValues = shape.animation?.initialValues;
+
+    /// Dropped once the editor has written the gesture into the shape's track
+    /// and sent it back, for the reason the actionables drop theirs: by then the
+    /// move is in the schema, and leaving the edit in place would count it
+    /// twice.
+    useEffect(() => {
+        setEdit(noToolEdit);
+    }, [
+        initialValues?.translate?.[0],
+        initialValues?.translate?.[1],
+        initialValues?.rotate,
+        initialValues?.rotateCenter,
+        initialValues?.scale,
+        initialValues?.opacity,
+    ]);
+
+    /// The same `MessageEdit` an actionable sends, naming this shape alone: the
+    /// editor resolves the pair against the schemas it holds, so an id naming a
+    /// shape lands on that shape's own track — and creates one if it had none.
+    const commit = (values: InertiaAnimationValuesBase) => {
+        if (!inertiaCanvasSize) return;
+
+        manager.sendMessageEdit({
+            tool,
+            values,
+            actionableIds: [{ hierarchyIdPrefix, hierarchyId: shape.id }],
+        });
+    };
+
+    const { layoutBox, canDragBody, pointerHandlers, toolHandles } = useToolGesture({
+        nodeId,
+        elementRef: boxRef,
+        initialValues,
+        /// The actionable's transform as it is drawn right now: this shape's
+        /// canvas sits inside the element carrying it, so a gesture out here is
+        /// measured through it and an offset authored in here lands under it.
+        outer: actionableId && controller ? controller.valuesFor(actionableId) : identityValues,
+        // Reaching here at all means the editor has this shape selected and the
+        // viewport is in actionable mode: nothing renders this chrome otherwise.
+        canEdit: true,
+        tool,
+        edit,
+        setEdit,
+        commit,
+    });
+
+    return (
+        <div
+            {...pointerHandlers}
+            // A press on a shape belongs to the shape. Without stopping here it
+            // would go on to the wrapper the actionable's own drag listens on,
+            // and one gesture would move both.
+            onClick={(e) => e.stopPropagation()}
+            style={{
+                position: "absolute",
+                left: 0,
+                top: 0,
+                width: layoutBox.width || "100%",
+                height: layoutBox.height || "100%",
+                border: `2px solid ${HANDLE_COLOR}`,
+                cursor: canDragBody ? "grab" : "default",
+                touchAction: "none",
+                boxSizing: "border-box",
+            }}
+        >
+            {toolHandles}
+        </div>
     );
 };
 
@@ -2171,17 +2484,35 @@ const InertiaGuts: React.FC<DraggableProps> = React.memo(
       && layoutSize.width > 0
       && layoutSize.height > 0;
 
-    /// A shape with no animation of its own is backdrop: it belongs to the
-    /// actionable, moves only as the actionable moves, and shares one canvas
-    /// with every other shape like it. A shape that was given a track is a
-    /// drawing in its own right and gets a canvas of its own, so the controller
-    /// can move it without disturbing the actionable or the other shapes.
-    const backdrop = useMemo(() => shapes.filter(shape => !shape.animation), [shapes]);
+    /// Whether the editor has picked a shape, by the shape's own id — the same
+    /// selection the actionables are picked out of, since a shape travels as an
+    /// `ActionableIdPair` like anything else. Which of the two an id names is
+    /// not on the wire: both ends hold the schemas and resolve it by looking.
+    const selectedShapeIds = useMemo(() => {
+      if (!inertiaDataModel?.isActionable) return new Set<string>();
+      return new Set(Array.from(inertiaDataModel.actionableIdPairs ?? []).map(pair => pair.hierarchyId));
+    }, [inertiaDataModel?.isActionable, inertiaDataModel?.actionableIdPairs]);
+
+    /// Whether a shape is drawn on a canvas of its own rather than sharing the
+    /// backdrop.
+    ///
+    /// A track is one reason — it has to be able to move without dragging every
+    /// other shape with it — and being selected is the other: the border and the
+    /// handles are fitted to one shape's box, and a shape sharing a canvas has
+    /// no box of its own to fit them to. The same split the Swift runtime makes
+    /// in `isDrawnAlone`.
+    const isDrawnAlone = useCallback(
+      (shape: InertiaShape) => !!shape.animation || selectedShapeIds.has(shape.id),
+      [selectedShapeIds]
+    );
+
+    /// A shape with no animation of its own and nobody's attention is backdrop:
+    /// it belongs to the actionable, moves only as the actionable moves, and
+    /// shares one canvas with every other shape like it.
+    const backdrop = useMemo(() => shapes.filter(shape => !isDrawnAlone(shape)), [shapes, isDrawnAlone]);
     const drawn = useMemo(
-      () => shapes
-        .map((shape, index) => ({ shape, index }))
-        .filter(({ shape }) => !!shape.animation),
-      [shapes]
+      () => shapes.filter(isDrawnAlone),
+      [shapes, isDrawnAlone]
     );
 
     return (
@@ -2214,14 +2545,20 @@ const InertiaGuts: React.FC<DraggableProps> = React.memo(
             over the backdrop in the order they were authored — shapes have no
             z-index of their own, and the file's order is the only ordering
             anyone has expressed. */}
-        {hasCanvas && drawn.map(({ shape, index }) => (
+        {hasCanvas && drawn.map(shape => (
           <InertiaShapeCanvas
-            key={`${hierarchyId}--shape--${index}`}
+            // Instance-scoped, because two instances of a card need two canvases
+            // — but named after the shape's own id rather than its place in the
+            // list, which is the name a selection carries and the name that
+            // survives the shape beside it being deleted.
+            key={`${hierarchyId}--${shape.id}`}
             shapes={[shape]}
             actionableSize={layoutSize}
             animation={shape.animation}
-            nodeId={hierarchyId ? `${hierarchyId}--shape--${index}` : undefined}
+            nodeId={hierarchyId ? `${hierarchyId}--${shape.id}` : undefined}
             hierarchyIdPrefix={hierarchyIdPrefix}
+            actionableId={hierarchyId}
+            selected={selectedShapeIds.has(shape.id) ? shape : undefined}
           />
         ))}
 
