@@ -1,6 +1,6 @@
 import React from 'react'
 import {decode} from '@msgpack/msgpack'
-import {InertiaAnimationSchema, MessageTranslation, MessageActionables, MessageActionable, InertiaSchemaWrapper, InertiaAnimationInvokeType, WebSocketClient, InertiaDataModel, InertiaCanvasSize, MessageType, MessageWrapper, InertiaID, Tree, Node, ActionableIdPair, AnimationSignal, MessagePlaybackProgress, InertiaPlayback, valuesAtTime, sanitizeValues, trackDuration, InertiaShape, Vertex, shapeTriangles, shapeBounds, normalizeShape, inertiaFileExtension, InertiaTool, InertiaToolEdit, identityValues, noToolEdit, isNoToolEdit, addToolEdits, applyToolEdit, minimumToolScale, InertiaAnimationValues as InertiaAnimationValuesBase} from 'inertia-base'
+import {InertiaAnimationSchema, MessageTranslation, MessageActionables, MessageActionable, InertiaSchemaWrapper, InertiaAnimationInvokeType, WebSocketClient, InertiaDataModel, InertiaCanvasSize, MessageType, MessageWrapper, InertiaID, Tree, Node, ActionableIdPair, AnimationSignal, MessagePlaybackProgress, InertiaPlayback, authoredLoopDuration, valuesAtTime, sanitizeValues, trackDuration, InertiaShape, Vertex, shapeTriangles, shapeBounds, normalizeShape, inertiaFileExtension, InertiaTool, InertiaToolEdit, identityValues, noToolEdit, isNoToolEdit, addToolEdits, applyToolEdit, minimumToolScale, InertiaAnimationValues as InertiaAnimationValuesBase} from 'inertia-base'
 
 export type InertiaContainerProps = {
     children: React.ReactElement,
@@ -184,9 +184,13 @@ export class InertiaPlaybackController {
     /// handles size themselves against and what the readout shows.
     private renderedValues = new Map<string, InertiaAnimationValuesBase>();
 
-    /// How long one loop lasts, as set on the editor's timeline. Applies from
-    /// the next frame, so resizing the timeline mid-run stretches the loop
-    /// rather than waiting for it to be restarted.
+    /// How long one loop lasts.
+    ///
+    /// Seeded from the schemas — the loop is part of what was authored, so a
+    /// shipped build loops over the span its animation was drawn against
+    /// without anything having to tell it — and moved from there by the
+    /// editor's timeline. Applies from the next frame, so resizing the timeline
+    /// mid-run stretches the loop rather than waiting for it to be restarted.
     public loopDuration: number = InertiaPlayback.defaultLoopDuration;
     public playheadTime: number = 0;
     /// Whether a run is on screen: playing, or holding the frame it finished on.
@@ -254,6 +258,16 @@ export class InertiaPlaybackController {
     /// run would take it away from whoever is scrubbing.
     public setSchemas(schemas: Map<string, InertiaAnimationSchema>): void {
         this.schemas = schemas;
+
+        // The loop travels with the schemas, so a project authored at a length
+        // other than the default plays at it from the first send — and in a
+        // shipped build, where no editor is ever going to say otherwise. An
+        // empty set leaves the current loop alone rather than snapping back to
+        // the default.
+        const authored = authoredLoopDuration(schemas.values());
+        if (authored !== null) {
+            this.loopDuration = authored;
+        }
 
         /// Whether this call is what started something, as opposed to finding it
         /// already started. Only a fresh trigger starts the clock: the schemas

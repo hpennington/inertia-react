@@ -30,7 +30,7 @@
   },
   "dependencies": {
     "@msgpack/msgpack": "^3.0.0",
-    "inertia-base": "^0.3.0",
+    "inertia-base": "file:///../inertia-base",
     "net": "^1.0.2"
   }
 }
