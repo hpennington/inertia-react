@@ -1639,6 +1639,11 @@ export function useToolGesture({
 
   const start = useRef<ToolGestureStart | null>(null);
   const moved = useRef(false);
+  /// Whether this press has actually dragged anything, as opposed to whether it
+  /// still counts as a click. The two part company on a knob: a press on one is
+  /// never a click — see `pointerHandlers` — but a press that never moved has
+  /// authored nothing, and is not an edit to send.
+  const dragged = useRef(false);
   /// The node's laid-out box, which is what the handles are placed around.
   /// Measured into state rather than read off the ref while rendering: a ref
   /// read is not reactive, so handles would keep the size the node had when
@@ -1746,6 +1751,7 @@ export function useToolGesture({
       size,
     };
     moved.current = false;
+    dragged.current = false;
   };
 
   /// What the editor is told: the values this node's schema starts it at with
@@ -1823,6 +1829,7 @@ export function useToolGesture({
     const point = inContainerSpace(clientX, clientY);
     if (Math.abs(point.x - opening.origin.x) > 2 || Math.abs(point.y - opening.origin.y) > 2) {
       moved.current = true;
+      dragged.current = true;
     }
 
     const next = editAt(point);
@@ -1864,11 +1871,21 @@ export function useToolGesture({
   /// schema. One message whatever the tool, carrying the whole transform: a
   /// keyframe holds all five values, so the four this gesture did not touch
   /// have to travel with the one it did.
+  ///
+  /// A press that never moved is a tap — the selection toggle's — and has
+  /// nothing to author, so nothing is sent for it. Committing it anyway handed
+  /// the editor a no-op transform on every tap, which the editor records as an
+  /// edit: it writes a schema for a node that had none and hands the schemas
+  /// straight back, and a fresh `auto` schema arriving is what starts a run. So
+  /// tapping a node to unselect it played the animation. The other two runtimes
+  /// already end the gesture this way — Compose commits only once its drag
+  /// threshold is crossed, and SwiftUI's `DragGesture` never opens on a tap.
   const stopGesture = () => {
-    if (start.current && inertiaCanvasSize) {
+    if (start.current && dragged.current && inertiaCanvasSize) {
       commit(authoredValues(edit));
     }
     start.current = null;
+    dragged.current = false;
     guides?.hide();
   };
 
@@ -1881,6 +1898,7 @@ export function useToolGesture({
     if (canEdit || !start.current) return;
     start.current = null;
     moved.current = false;
+    dragged.current = false;
     guides?.hide();
     setEdit(noToolEdit);
   }, [canEdit]);
@@ -2195,14 +2213,30 @@ const InertiaShapeCanvas: React.FC<{
         return new Float32Array(data);
     }, [shapes, bounds]);
 
+    /// The length a shape's coordinates are multiples of, across and down alike:
+    /// the shorter side of the actionable's box.
+    ///
+    /// One length rather than two is what keeps a described vector the shape it
+    /// was described as. Scaling x by the element's width and y by its height
+    /// puts a shape in a square space that is then stretched to fit the element,
+    /// so a circle of size 1 came out an oval on every element that was not
+    /// itself square, and the taller or wider the element the further from round
+    /// it got. Measured against one side, a circle is round, a square is square,
+    /// and a shape keeps its proportions at every size that element takes.
+    ///
+    /// The shorter side rather than the longer one, so a shape authored at 1
+    /// still fits inside the element it backs in both directions. The same unit
+    /// the Swift and Kotlin runtimes measure with — see `InertiaShapesView.unit`.
+    const unit = Math.min(actionableSize.width, actionableSize.height);
+
     /// The canvas element's box in CSS pixels, relative to the actionable's
     /// top-left corner.
     const box = useMemo(() => bounds && {
-        left: bounds.x * actionableSize.width,
-        top: bounds.y * actionableSize.height,
-        width: bounds.width * actionableSize.width,
-        height: bounds.height * actionableSize.height
-    }, [bounds, actionableSize]);
+        left: bounds.x * unit,
+        top: bounds.y * unit,
+        width: bounds.width * unit,
+        height: bounds.height * unit
+    }, [bounds, unit]);
 
     useEffect(() => {
         const canvas = canvasRef.current;
