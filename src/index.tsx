@@ -2525,7 +2525,7 @@ const InertiaGuts: React.FC<DraggableProps> = React.memo(
     /// no box of its own to fit them to. The same split the Swift runtime makes
     /// in `isDrawnAlone`.
     const isDrawnAlone = useCallback(
-      (shape: InertiaShape) => !!shape.animation || selectedShapeIds.has(shape.id),
+      (shape: InertiaShape) => !!shape.animation || !!shape.ownCanvas || selectedShapeIds.has(shape.id),
       [selectedShapeIds]
     );
 
