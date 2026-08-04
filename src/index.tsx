@@ -1,6 +1,6 @@
 import React from 'react'
 import {decode} from '@msgpack/msgpack'
-import {InertiaAnimationSchema, MessageTranslation, MessageActionables, MessageActionable, InertiaSchemaWrapper, InertiaAnimationInvokeType, WebSocketClient, InertiaDataModel, InertiaCanvasSize, MessageType, MessageWrapper, InertiaID, Tree, Node, ActionableIdPair, AnimationSignal, MessagePlaybackProgress, InertiaPlayback, authoredLoopDuration, valuesAtTime, sanitizeValues, trackDuration, InertiaShape, Vertex, normalizedShapeTriangles, shapeBounds, inertiaFileExtension, InertiaTool, InertiaToolEdit, identityValues, noToolEdit, isNoToolEdit, addToolEdits, applyToolEdit, minimumToolScale, InertiaAnimationValues as InertiaAnimationValuesBase} from 'inertia-base'
+import {InertiaAnimationSchema, MessageTranslation, MessageActionables, MessageActionable, InertiaSchemaWrapper, InertiaAnimationInvokeType, WebSocketClient, InertiaDataModel, InertiaCanvasSize, MessageType, MessageWrapper, InertiaID, Tree, Node, ActionableIdPair, AnimationSignal, MessagePlaybackProgress, InertiaPlayback, authoredLoopDuration, valuesAtTime, sanitizeValues, InertiaShape, Vertex, normalizedShapeTriangles, shapeBounds, inertiaFileExtension, InertiaTool, InertiaToolEdit, identityValues, noToolEdit, isNoToolEdit, addToolEdits, applyToolEdit, minimumToolScale, InertiaAnimationValues as InertiaAnimationValuesBase} from 'inertia-base'
 
 export type InertiaContainerProps = {
     children: React.ReactElement,
@@ -228,13 +228,12 @@ export class InertiaPlaybackController {
     /// One turn of the timeline: the loop the editor drew, or the longest track,
     /// whichever is longer. Anything recorded past the end of the loop stretches
     /// it, which keeps every track the same length as every other.
+    ///
+    /// Worked out by `InertiaPlayback.duration` rather than in here, so a canvas
+    /// view drawing these schemas somewhere the app is not pads its tracks to the
+    /// same turn and the two playheads mean the same thing.
     get playbackDuration(): number {
-        let longestTrack = 0;
-        this.schemas.forEach(schema => {
-            longestTrack = Math.max(longestTrack, trackDuration(schema));
-        });
-
-        return Math.max(this.loopDuration, longestTrack);
+        return InertiaPlayback.duration(this.loopDuration, this.schemas.values());
     }
 
     /// Translations are stored normalized, so nothing can be drawn until the
@@ -262,8 +261,25 @@ export class InertiaPlaybackController {
     /// animation is exactly when nothing is going to call `trigger()` for it.
     /// Neither happens if the editor has parked the playhead, where starting a
     /// run would take it away from whoever is scrubbing.
+    ///
+    /// An animation that is no longer in the set loses its playback state along
+    /// with its track, rather than being left behind marked as running. Nothing
+    /// is lost by it — a state for a prefix nothing holds a schema for reads
+    /// exactly as one that has not been triggered — and an animation authored
+    /// again under the same name starts from a state that agrees it has not run.
     public setSchemas(schemas: Map<string, InertiaAnimationSchema>): void {
+        const previous = this.schemas;
         this.schemas = schemas;
+
+        // Only what this held a schema for and no longer does. A state the app
+        // put there itself — a `trigger()` or a `cancel()` for an animation
+        // whose schema is still on its way — has never been in here, and
+        // dropping it would lose the call.
+        previous.forEach((_, prefix) => {
+            if (!schemas.has(prefix)) {
+                this.states.delete(prefix);
+            }
+        });
 
         // The loop travels with the schemas, so a project authored at a length
         // other than the default plays at it from the first send — and in a
@@ -740,6 +756,19 @@ export const useInertia = (): InertiaPlaybackHandle => {
     }), [controller]);
 };
 
+/// Takes the whole project from the editor, in place of the one this container
+/// was drawing.
+///
+/// Replaced rather than merged in: the editor sends every animation it has on
+/// every edit, so the message says what the project *is*, not what changed in
+/// it. Merged in, an animation deleted in the editor had nothing to say — the
+/// wrapper for it simply stopped arriving — and the app under test went on
+/// playing it until it was rebuilt. Same for a shape or a keypoint dropped from
+/// one, which travel inside their schema.
+///
+/// Only what the editor sends is ever in here to lose: a container in `dev`
+/// loads nothing off the network, and a shipped build never opens the socket
+/// this arrives on.
 function handleMessageSchema(
     schemaWrappers: InertiaSchemaWrapper[],
     inertiaDataModel: InertiaDataModel | null,
@@ -752,6 +781,9 @@ function handleMessageSchema(
         return;
     }
 
+    const inertiaSchemas = new Map<string, InertiaAnimationSchema>();
+    const actionableIdToAnimationIdMap = new Map<string, string>();
+
     for (const schemaWrapper of schemaWrappers) {
         console.log(
             `[INERTIA_LOG]: [handleMessageSchema] wrapper - containerId: ${schemaWrapper.container.containerId}, actionableId: ${schemaWrapper.actionableId}, animationId: ${schemaWrapper.animationId}`
@@ -760,28 +792,23 @@ function handleMessageSchema(
         console.log(`[INERTIA_LOG]: [handleMessageSchema] my containerId: ${inertiaDataModel.containerId}`);
 
         if (schemaWrapper.container.containerId === inertiaDataModel.containerId) {
-            setInertiaDataModel(prev => {
-                const updated = { ...prev };
+            // The mapping from actionable ID to animation ID
+            actionableIdToAnimationIdMap.set(schemaWrapper.actionableId, schemaWrapper.animationId);
+            // The schema, by its animation ID
+            inertiaSchemas.set(schemaWrapper.animationId, schemaWrapper.schema);
 
-                // Store the mapping from actionable ID to animation ID
-                updated.actionableIdToAnimationIdMap = new Map(prev.actionableIdToAnimationIdMap);
-                updated.actionableIdToAnimationIdMap.set(schemaWrapper.actionableId, schemaWrapper.animationId);
-                // Store the schema by its animation ID
-                updated.inertiaSchemas = new Map(prev.inertiaSchemas);
-                updated.inertiaSchemas.set(schemaWrapper.animationId, schemaWrapper.schema);
-
-                console.log(
-                    `[INERTIA_LOG]: ✅ stored schema - animationId: ${schemaWrapper.animationId} actionableId: ${schemaWrapper.actionableId}, keyframes: ${schemaWrapper.schema.keyframes?.length ?? 0}`
-                );
-                console.log(`[INERTIA_LOG]: actionableIdToAnimationIdMap:`, Object.fromEntries(updated.actionableIdToAnimationIdMap));
-                console.log(`[INERTIA_LOG]: inertiaSchemas keys:`, Array.from(updated.inertiaSchemas.keys()));
-
-                return updated;
-            });
+            console.log(
+                `[INERTIA_LOG]: ✅ stored schema - animationId: ${schemaWrapper.animationId} actionableId: ${schemaWrapper.actionableId}, keyframes: ${schemaWrapper.schema.keyframes?.length ?? 0}`
+            );
         } else {
             console.log(`[INERTIA_LOG]: ❌ skipped - container mismatch (wanted: ${schemaWrapper.container.containerId}, have: ${inertiaDataModel.containerId})`);
         }
     }
+
+    console.log(`[INERTIA_LOG]: actionableIdToAnimationIdMap:`, Object.fromEntries(actionableIdToAnimationIdMap));
+    console.log(`[INERTIA_LOG]: inertiaSchemas keys:`, Array.from(inertiaSchemas.keys()));
+
+    setInertiaDataModel(prev => ({ ...prev, inertiaSchemas, actionableIdToAnimationIdMap }));
 }
 
 // ------------------ Alignment grid ------------------
