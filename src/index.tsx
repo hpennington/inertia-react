@@ -2484,6 +2484,29 @@ const InertiaGuts: React.FC<DraggableProps> = React.memo(
       && layoutSize.width > 0
       && layoutSize.height > 0;
 
+    /// Tells the editor how big this actionable was laid out, so a shape
+    /// authored against it can be drawn to size in a window with no copy of
+    /// this app to measure — see `MessageNodeMeasured`.
+    ///
+    /// Only nodes carrying shapes are measured at all, which is also the only
+    /// selection the editor can ask this question about. Sent again whenever an
+    /// editor attaches: layout happened long before it was listening, and will
+    /// not happen again just because it turned up.
+    useEffect(() => {
+      if (!hierarchyId || !hierarchyIdPrefix) return;
+      if (layoutSize.width <= 0 || layoutSize.height <= 0) return;
+
+      const report = () => manager.sendMessageNodeMeasured({
+        hierarchyIdPrefix,
+        hierarchyId,
+        sizeX: layoutSize.width,
+        sizeY: layoutSize.height,
+      });
+
+      report();
+      return manager.addConnectedListener(report);
+    }, [hierarchyId, hierarchyIdPrefix, layoutSize.width, layoutSize.height]);
+
     /// Whether the editor has picked a shape, by the shape's own id — the same
     /// selection the actionables are picked out of, since a shape travels as an
     /// `ActionableIdPair` like anything else. Which of the two an id names is
