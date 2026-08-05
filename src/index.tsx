@@ -2296,13 +2296,22 @@ const InertiaShapeCanvas: React.FC<{
     const unit = Math.min(actionableSize.width, actionableSize.height);
 
     /// The canvas element's box in CSS pixels, relative to the actionable's
-    /// top-left corner.
+    /// top-left corner — which is what an absolutely positioned child is offset
+    /// from, and not where a shape's coordinates are measured from.
+    ///
+    /// The origin a shape is drawn about is the *middle* of the actionable, so a
+    /// shape half the size of the element it backs sits in the middle of it
+    /// rather than hanging off a corner. Half the element is the step between the
+    /// two, and it is what the Swift runtime gets for free by centring its ZStack
+    /// — see `InertiaShapesView.body`.
     const box = useMemo(() => bounds && {
-        left: bounds.x * unit,
-        top: bounds.y * unit,
+        left: actionableSize.width / 2 + bounds.x * unit,
+        top: actionableSize.height / 2 + bounds.y * unit,
         width: bounds.width * unit,
         height: bounds.height * unit
-    }, [bounds, unit]);
+    // Both sides of the element, not just `unit`: the half-view step moves when
+    // the longer side changes, which is a resize `unit` alone does not see.
+    }, [bounds, unit, actionableSize.width, actionableSize.height]);
 
     useEffect(() => {
         const canvas = canvasRef.current;
