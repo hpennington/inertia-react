@@ -1,6 +1,6 @@
 import React from 'react'
 import {decode} from '@msgpack/msgpack'
-import {InertiaAnimationSchema, MessageTranslation, MessageActionables, MessageActionable, InertiaSchemaWrapper, InertiaAnimationInvokeType, WebSocketClient, InertiaDataModel, InertiaCanvasSize, MessageType, MessageWrapper, InertiaID, Tree, Node, ActionableIdPair, AnimationSignal, MessagePlaybackProgress, InertiaPlayback, authoredLoopDuration, valuesAtTime, sanitizeValues, InertiaShape, Vertex, normalizedShapeTriangles, shapeBounds, inertiaFileExtension, InertiaTool, InertiaToolEdit, identityValues, noToolEdit, isNoToolEdit, addToolEdits, applyToolEdit, minimumToolScale, InertiaAnimationValues as InertiaAnimationValuesBase} from 'inertia-base'
+import {InertiaAnimationSchema, MessageTranslation, MessageActionables, MessageActionable, InertiaSchemaWrapper, InertiaAnimationInvokeType, WebSocketClient, InertiaDataModel, InertiaCanvasSize, MessageType, MessageWrapper, InertiaID, Tree, Node, ActionableIdPair, AnimationSignal, MessagePlaybackProgress, InertiaPlayback, authoredLoopDuration, valuesAtTime, sanitizeValues, InertiaShape, InertiaShapePosition, stackedShapes, Vertex, normalizedShapeTriangles, shapeBounds, inertiaFileExtension, InertiaTool, InertiaToolEdit, identityValues, noToolEdit, isNoToolEdit, addToolEdits, applyToolEdit, minimumToolScale, InertiaAnimationValues as InertiaAnimationValuesBase} from 'inertia-base'
 
 export type InertiaContainerProps = {
     children: React.ReactElement,
@@ -2156,8 +2156,42 @@ function layoutSizeOf(element: HTMLElement): InertiaCanvasSize {
     return { width: element.offsetWidth, height: element.offsetHeight };
 }
 
+/// These shapes as the canvases they are drawn on, back to front: the order
+/// their z-indexes put them in, cut into runs wherever one of them has to be
+/// drawn on a canvas of its own.
+///
+/// A shape drawn alone is a layer by itself; the shapes between two of those
+/// share one canvas, the way every backdrop shape here used to. Cutting the run
+/// at those points is what makes a z-index mean the same thing for a moving
+/// shape as for a still one: canvases are elements, elements paint in the order
+/// they are written, so an animated shape can sit *behind* a plain one rather
+/// than always floating over the whole backdrop.
+///
+/// The same layering the Swift runtime builds in `InertiaShapesView.layers`.
+function shapeLayers(
+    shapes: Array<InertiaShape>,
+    isDrawnAlone: (shape: InertiaShape) => boolean
+): Array<Array<InertiaShape>> {
+    const layers: Array<Array<InertiaShape>> = [];
+    let isSharedRunOpen = false;
+
+    stackedShapes(shapes).forEach(shape => {
+        if (isDrawnAlone(shape)) {
+            layers.push([shape]);
+            isSharedRunOpen = false;
+        } else if (isSharedRunOpen) {
+            layers[layers.length - 1].push(shape);
+        } else {
+            layers.push([shape]);
+            isSharedRunOpen = true;
+        }
+    });
+
+    return layers;
+}
+
 /// The actionable's canvas: the shapes authored alongside its animation, drawn
-/// in WebGL behind its content.
+/// in WebGL on whichever side of its content they asked for — see `position`.
 ///
 /// Sized and placed by the box the shapes themselves occupy — `actionableSize`
 /// is the view, and the shapes are multiples of it — so one reaching past the
@@ -2178,6 +2212,11 @@ function layoutSizeOf(element: HTMLElement): InertiaCanvasSize {
 const InertiaShapeCanvas: React.FC<{
     shapes: Array<InertiaShape>;
     actionableSize: InertiaCanvasSize;
+    /// Which side of the actionable's content this canvas is drawn on, which is
+    /// the side its shapes asked for — see `InertiaShapePosition`. All of them
+    /// share it: the shapes are grouped by position before a canvas is made for
+    /// any of them.
+    position?: InertiaShapePosition;
     animation?: InertiaAnimationSchema;
     nodeId?: string;
     hierarchyIdPrefix?: string;
@@ -2189,7 +2228,7 @@ const InertiaShapeCanvas: React.FC<{
     /// is what gives a shape a canvas to itself, so there is never more than
     /// one — see `InertiaGuts`.
     selected?: InertiaShape;
-}> = ({ shapes, actionableSize, animation, nodeId, hierarchyIdPrefix, actionableId, selected }) => {
+}> = ({ shapes, actionableSize, position = InertiaShapePosition.bottom, animation, nodeId, hierarchyIdPrefix, actionableId, selected }) => {
     /// What the controller writes the transform to, and what the chrome is
     /// placed inside: the canvas cannot hold the border and the handles, since a
     /// `<canvas>` has no children.
@@ -2353,7 +2392,13 @@ const InertiaShapeCanvas: React.FC<{
                 // it stays behind the app's own content too — a shape is drawn
                 // behind the views, and it is picked in the hierarchy panel
                 // rather than out here.
-                zIndex: -1
+                //
+                // A shape asking for the other side wants exactly what the
+                // negative index was undoing, so it is simply not applied:
+                // painted in with the positioned siblings, in the DOM order the
+                // actionable writes its canvases in, which is over the content
+                // and under the chrome that follows it there.
+                zIndex: position === InertiaShapePosition.top ? 0 : -1
             }}
         >
             <canvas
@@ -2590,14 +2635,47 @@ const InertiaGuts: React.FC<DraggableProps> = React.memo(
       [selectedShapeIds]
     );
 
-    /// A shape with no animation of its own and nobody's attention is backdrop:
-    /// it belongs to the actionable, moves only as the actionable moves, and
-    /// shares one canvas with every other shape like it.
-    const backdrop = useMemo(() => shapes.filter(shape => !isDrawnAlone(shape)), [shapes, isDrawnAlone]);
-    const drawn = useMemo(
-      () => shapes.filter(isDrawnAlone),
+    /// The canvases drawn behind this actionable's content, and the ones drawn
+    /// over it — the two sides a shape's `position` picks between, each cut into
+    /// layers by `shapeLayers`.
+    ///
+    /// Split before either is layered, because the sides are separate stacks: a
+    /// z-index orders the shapes on one side of the content, and no number puts
+    /// a backdrop in front of the view it backs.
+    const bottomLayers = useMemo(
+      () => shapeLayers(shapes.filter(shape => (shape.position ?? InertiaShapePosition.bottom) !== InertiaShapePosition.top), isDrawnAlone),
       [shapes, isDrawnAlone]
     );
+    const topLayers = useMemo(
+      () => shapeLayers(shapes.filter(shape => shape.position === InertiaShapePosition.top), isDrawnAlone),
+      [shapes, isDrawnAlone]
+    );
+
+    /// One layer as a canvas: a shape drawn alone carries its own track and the
+    /// editor's selection, and a shared run is the backdrop every shape here
+    /// used to be part of.
+    ///
+    /// Named after the first shape in the layer, which is a name no other layer
+    /// can take — a shape belongs to exactly one — and one that survives the
+    /// shape beside it being deleted. Instance-scoped, because two instances of
+    /// a card need two canvases.
+    const canvasForLayer = (layer: Array<InertiaShape>, position: InertiaShapePosition) => {
+      const alone = layer.length === 1 && isDrawnAlone(layer[0]) ? layer[0] : undefined;
+
+      return (
+        <InertiaShapeCanvas
+          key={`${hierarchyId}--${layer[0].id}`}
+          shapes={layer}
+          actionableSize={layoutSize}
+          position={position}
+          animation={alone?.animation}
+          nodeId={alone && hierarchyId ? `${hierarchyId}--${alone.id}` : undefined}
+          hierarchyIdPrefix={alone ? hierarchyIdPrefix : undefined}
+          actionableId={alone ? hierarchyId : undefined}
+          selected={alone && selectedShapeIds.has(alone.id) ? alone : undefined}
+        />
+      );
+    };
 
     return (
       <div
@@ -2617,34 +2695,9 @@ const InertiaGuts: React.FC<DraggableProps> = React.memo(
           isolation: "isolate",
         }}
       >
-        {/* Painted behind the content by the canvas's own z-index. */}
-        {hasCanvas && backdrop.length > 0 && (
-          <InertiaShapeCanvas
-            shapes={backdrop}
-            actionableSize={layoutSize}
-          />
-        )}
-
-        {/* One canvas each, moved by the track each was authored with. Drawn
-            over the backdrop in the order they were authored — shapes have no
-            z-index of their own, and the file's order is the only ordering
-            anyone has expressed. */}
-        {hasCanvas && drawn.map(shape => (
-          <InertiaShapeCanvas
-            // Instance-scoped, because two instances of a card need two canvases
-            // — but named after the shape's own id rather than its place in the
-            // list, which is the name a selection carries and the name that
-            // survives the shape beside it being deleted.
-            key={`${hierarchyId}--${shape.id}`}
-            shapes={[shape]}
-            actionableSize={layoutSize}
-            animation={shape.animation}
-            nodeId={hierarchyId ? `${hierarchyId}--${shape.id}` : undefined}
-            hierarchyIdPrefix={hierarchyIdPrefix}
-            actionableId={hierarchyId}
-            selected={selectedShapeIds.has(shape.id) ? shape : undefined}
-          />
-        ))}
+        {/* Painted behind the content by each canvas's own z-index, and back to
+            front among themselves by the order they are written here. */}
+        {hasCanvas && bottomLayers.map(layer => canvasForLayer(layer, InertiaShapePosition.bottom))}
 
         <div
           style={{
@@ -2653,6 +2706,12 @@ const InertiaGuts: React.FC<DraggableProps> = React.memo(
         >
           {children}
         </div>
+
+        {/* The same canvases on the other side of the content, for the shapes
+            authored to sit over the view rather than behind it. After the
+            content in the DOM, which is what paints them over it — the two
+            differ in nothing else. */}
+        {hasCanvas && topLayers.map(layer => canvasForLayer(layer, InertiaShapePosition.top))}
 
         {isSelected && inertiaDataModel?.isActionable && (
           <div
