@@ -156,6 +156,14 @@ type RegisteredNode = {
     /// nothing at all — the actionable's transform is already on the element
     /// this one sits inside, and drawing it again here would apply it twice.
     isShape?: boolean;
+    /// Whether this element is taken off screen until the run is on it — a shape
+    /// that appears with the animation rather than backing it, see
+    /// `InertiaShape.showsBeforeAnimation`.
+    ///
+    /// Held here rather than read off the schema because it is not a schema
+    /// question: whether a canvas is drawn at all is decided per frame, from the
+    /// same clock its transform is, and React has no state that ticks with it.
+    hidesBeforeAnimation?: boolean;
 };
 
 type ActionableState = {
@@ -337,14 +345,18 @@ export class InertiaPlaybackController {
     ///
     /// A shape with no track registers too, when the editor has it selected: it
     /// stays where it was authored, but a gesture on it still has to move it,
-    /// and this is what puts that gesture on screen. See `renderNode`.
+    /// and this is what puts that gesture on screen. So does one that waits for
+    /// the animation before it is drawn at all, whether or not it moves once it
+    /// is — that is a decision taken per frame off this clock, and registering
+    /// is how an element gets one. See `renderNode`.
     public registerShapeNode(
         id: string,
         hierarchyIdPrefix: string,
         element: HTMLElement,
-        schema?: InertiaAnimationSchema
+        schema?: InertiaAnimationSchema,
+        hidesBeforeAnimation?: boolean
     ): void {
-        this.nodes.set(id, { hierarchyIdPrefix, element, schema, isShape: true });
+        this.nodes.set(id, { hierarchyIdPrefix, element, schema, isShape: true, hidesBeforeAnimation });
         this.renderNode(id);
     }
 
@@ -353,6 +365,7 @@ export class InertiaPlaybackController {
         if (node) {
             node.element.style.transform = "";
             node.element.style.opacity = "";
+            node.element.style.visibility = "";
         }
         this.nodes.delete(hierarchyId);
         this.edits.delete(hierarchyId);
@@ -628,6 +641,29 @@ export class InertiaPlaybackController {
 
         const edit = this.edits.get(hierarchyId) ?? null;
         const schema = node.schema ?? (node.isShape ? undefined : this.schemas.get(node.hierarchyIdPrefix));
+
+        const state = this.states.get(node.hierarchyIdPrefix);
+        const isTriggered = !!state?.trigger && !state.isCancelled;
+        // A shape's own track does not share its actionable's `invokeType`: one
+        // marked `auto` runs as soon as the clock does, even while the
+        // actionable it backs is still waiting on the app to trigger it. A shape
+        // given a `trigger` animation waits for that actionable, which is the
+        // only trigger a shape can be reached by.
+        const isPlayable = isTriggered
+            || (!!node.schema && node.schema.invokeType === InertiaAnimationInvokeType.auto);
+        // Scrubbing shows the animation without running it, which is why a
+        // parked playhead draws the same way a running one does.
+        const isShowingTrack = isPlayable && (this.isRunning || this.seekTime !== null);
+
+        // A shape that appears with the animation rather than backing it — see
+        // `InertiaShape.showsBeforeAnimation`. Decided ahead of the track,
+        // because a shape with no track of its own still has to be taken off
+        // screen, and hidden rather than unmounted so it keeps its canvas and
+        // the GPU buffer behind it across a run.
+        if (node.hidesBeforeAnimation) {
+            node.element.style.visibility = isShowingTrack ? "" : "hidden";
+        }
+
         if (!schema) {
             // Still drawn when the editor is dragging it: an actionable nobody
             // has animated yet has no schema until the first gesture is written
@@ -644,19 +680,6 @@ export class InertiaPlaybackController {
             this.write(hierarchyId, node, applyToolEdit(identityValues, edit, this.canvasSize));
             return;
         }
-
-        const state = this.states.get(node.hierarchyIdPrefix);
-        const isTriggered = !!state?.trigger && !state.isCancelled;
-        // A shape's own track does not share its actionable's `invokeType`: one
-        // marked `auto` runs as soon as the clock does, even while the
-        // actionable it backs is still waiting on the app to trigger it. A shape
-        // given a `trigger` animation waits for that actionable, which is the
-        // only trigger a shape can be reached by.
-        const isPlayable = isTriggered
-            || (!!node.schema && node.schema.invokeType === InertiaAnimationInvokeType.auto);
-        // Scrubbing shows the animation without running it, which is why a
-        // parked playhead draws the same way a running one does.
-        const isShowingTrack = isPlayable && (this.isRunning || this.seekTime !== null);
 
         const base = isShowingTrack
             ? valuesAtTime(schema, this.playheadTime, this.playbackDuration, this.isRepeating)
@@ -2228,7 +2251,12 @@ const InertiaShapeCanvas: React.FC<{
     /// is what gives a shape a canvas to itself, so there is never more than
     /// one — see `InertiaGuts`.
     selected?: InertiaShape;
-}> = ({ shapes, actionableSize, position = InertiaShapePosition.bottom, animation, nodeId, hierarchyIdPrefix, actionableId, selected }) => {
+    /// Whether this canvas stays off screen until the animation is on it — the
+    /// one shape on it appears with the run rather than backing it, see
+    /// `InertiaShape.showsBeforeAnimation`. Another reason to register with the
+    /// controller: what is drawn is then a decision taken per frame.
+    hidesBeforeAnimation?: boolean;
+}> = ({ shapes, actionableSize, position = InertiaShapePosition.bottom, animation, nodeId, hierarchyIdPrefix, actionableId, selected, hidesBeforeAnimation }) => {
     /// What the controller writes the transform to, and what the chrome is
     /// placed inside: the canvas cannot hold the border and the handles, since a
     /// `<canvas>` has no children.
@@ -2237,19 +2265,23 @@ const InertiaShapeCanvas: React.FC<{
     const glRef = useRef<{ gl: WebGLRenderingContext; program: WebGLProgram; buffer: WebGLBuffer } | null>(null);
     const controller = useContext(InertiaPlaybackContext);
 
-    useEffect(() => {
+    // A layout effect rather than a passive one, because registering is also
+    // what takes a shape that waits for the animation *off* screen: run after
+    // the browser has painted, the first frame of it would be the one frame it
+    // is not supposed to be seen in.
+    React.useLayoutEffect(() => {
         const box = boxRef.current;
         if (!box || !controller || !nodeId || !hierarchyIdPrefix) {
             return;
         }
-        if (!animation && !selected) {
+        if (!animation && !selected && !hidesBeforeAnimation) {
             return;
         }
 
-        controller.registerShapeNode(nodeId, hierarchyIdPrefix, box, animation);
+        controller.registerShapeNode(nodeId, hierarchyIdPrefix, box, animation, hidesBeforeAnimation);
 
         return () => controller.unregisterNode(nodeId);
-    }, [controller, animation, nodeId, hierarchyIdPrefix, !!selected]);
+    }, [controller, animation, nodeId, hierarchyIdPrefix, !!selected, hidesBeforeAnimation]);
 
     /// The canvas's own box, in multiples of the actionable.
     const bounds = useMemo(() => shapeBounds(shapes), [shapes]);
@@ -2639,8 +2671,20 @@ const InertiaGuts: React.FC<DraggableProps> = React.memo(
     /// handles are fitted to one shape's box, and a shape sharing a canvas has
     /// no box of its own to fit them to. The same split the Swift runtime makes
     /// in `isDrawnAlone`.
+    ///
+    /// Appearing with the animation is a third: what a canvas can be taken off
+    /// screen by is `visibility`, which hides everything drawn on it, so a shape
+    /// that is not on screen the whole time cannot share one with shapes that
+    /// are. The Swift and Compose runtimes drop such a shape from the list they
+    /// layer instead — this one keeps the element and hides it, because the
+    /// vertex buffer behind it is a WebGL context that would otherwise be rebuilt
+    /// every time the run came round.
     const isDrawnAlone = useCallback(
-      (shape: InertiaShape) => !!shape.animation || !!shape.ownCanvas || selectedShapeIds.has(shape.id),
+      (shape: InertiaShape) =>
+        !!shape.animation
+          || !!shape.ownCanvas
+          || shape.showsBeforeAnimation === false
+          || selectedShapeIds.has(shape.id),
       [selectedShapeIds]
     );
 
@@ -2670,6 +2714,12 @@ const InertiaGuts: React.FC<DraggableProps> = React.memo(
     /// a card need two canvases.
     const canvasForLayer = (layer: Array<InertiaShape>, position: InertiaShapePosition) => {
       const alone = layer.length === 1 && isDrawnAlone(layer[0]) ? layer[0] : undefined;
+      // The shape being worked on stays drawn whatever it says: selection
+      // happens in the editor's hierarchy, but everything done to a shape after
+      // that is done to the thing on screen — dragged by its own box, sized by
+      // its handles — and one that vanished until the timeline was rolling could
+      // not be authored at all.
+      const isSelected = !!alone && selectedShapeIds.has(alone.id);
 
       return (
         <InertiaShapeCanvas
@@ -2681,7 +2731,8 @@ const InertiaGuts: React.FC<DraggableProps> = React.memo(
           nodeId={alone && hierarchyId ? `${hierarchyId}--${alone.id}` : undefined}
           hierarchyIdPrefix={alone ? hierarchyIdPrefix : undefined}
           actionableId={alone ? hierarchyId : undefined}
-          selected={alone && selectedShapeIds.has(alone.id) ? alone : undefined}
+          selected={isSelected ? alone : undefined}
+          hidesBeforeAnimation={!!alone && alone.showsBeforeAnimation === false && !isSelected}
         />
       );
     };
