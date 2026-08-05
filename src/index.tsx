@@ -1,6 +1,6 @@
 import React from 'react'
 import {decode} from '@msgpack/msgpack'
-import {InertiaAnimationSchema, MessageTranslation, MessageActionables, MessageActionable, InertiaSchemaWrapper, InertiaAnimationInvokeType, WebSocketClient, InertiaDataModel, InertiaCanvasSize, MessageType, MessageWrapper, InertiaID, Tree, Node, ActionableIdPair, AnimationSignal, MessagePlaybackProgress, InertiaPlayback, authoredLoopDuration, valuesAtTime, sanitizeValues, InertiaShape, InertiaShapePosition, stackedShapes, Vertex, normalizedShapeTriangles, shapeBounds, inertiaFileExtension, InertiaTool, InertiaToolEdit, identityValues, noToolEdit, isNoToolEdit, addToolEdits, applyToolEdit, minimumToolScale, InertiaAnimationValues as InertiaAnimationValuesBase} from 'inertia-base'
+import {InertiaAnimationSchema, MessageTranslation, MessageActionables, MessageActionable, InertiaSchemaWrapper, InertiaAnimationInvokeType, WebSocketClient, InertiaDataModel, InertiaCanvasSize, MessageType, MessageWrapper, InertiaID, Tree, Node, ActionableIdPair, AnimationSignal, MessagePlaybackProgress, InertiaPlayback, authoredLoopDuration, valuesAtTime, sanitizeValues, InertiaShape, InertiaShapePosition, stackedShapes, Vertex, normalizedShapeTriangles, shapeBounds, hitTestShapes, shapeClipPath, inertiaFileExtension, InertiaTool, InertiaToolEdit, identityValues, noToolEdit, isNoToolEdit, addToolEdits, applyToolEdit, minimumToolScale, InertiaAnimationValues as InertiaAnimationValuesBase} from 'inertia-base'
 
 export type InertiaContainerProps = {
     children: React.ReactElement,
@@ -2256,7 +2256,11 @@ const InertiaShapeCanvas: React.FC<{
     /// `InertiaShape.showsBeforeAnimation`. Another reason to register with the
     /// controller: what is drawn is then a decision taken per frame.
     hidesBeforeAnimation?: boolean;
-}> = ({ shapes, actionableSize, position = InertiaShapePosition.bottom, animation, nodeId, hierarchyIdPrefix, actionableId, selected, hidesBeforeAnimation }) => {
+    /// Picks the shape a click landed on up, or puts it down again. Absent
+    /// outside the editor, which is what leaves a shape the pure backdrop it is
+    /// in a shipped build.
+    onPick?: (shape: InertiaShape) => void;
+}> = ({ shapes, actionableSize, position = InertiaShapePosition.bottom, animation, nodeId, hierarchyIdPrefix, actionableId, selected, hidesBeforeAnimation, onPick }) => {
     /// What the controller writes the transform to, and what the chrome is
     /// placed inside: the canvas cannot hold the border and the handles, since a
     /// `<canvas>` has no children.
@@ -2405,6 +2409,26 @@ const InertiaShapeCanvas: React.FC<{
         gl.drawArrays(gl.TRIANGLES, 0, vertexData.length / 6);
     }, [vertexData, box]);
 
+    /// The clip that keeps a press on this canvas to the artwork, so a shape can
+    /// be picked by clicking it rather than only by finding its row in the
+    /// editor's hierarchy.
+    ///
+    /// A canvas is fitted to the box its shapes occupy together, and that box is
+    /// mostly not shape. Clipped to the drawing, the corner beside a circle and
+    /// the hole through an unfilled ring go on reaching the app's own content
+    /// underneath exactly as they did before any of this existed — `clip-path`
+    /// bounds what the browser will deliver a press to, not just what paints.
+    ///
+    /// Absent outside the editor, where there is nothing to pick.
+    const clipPath = useMemo(() => {
+        if (!onPick || !bounds || !box) return undefined;
+
+        const triangles = shapes.flatMap(shape => normalizedShapeTriangles(shape, bounds));
+        const path = shapeClipPath(triangles, box.width, box.height);
+
+        return path ? `path("${path}")` : undefined;
+    }, [onPick, shapes, bounds, box]);
+
     // Shapes enclosing no area have no canvas, which is also the state in which
     // there is nothing to draw.
     if (!box) return null;
@@ -2454,6 +2478,45 @@ const InertiaShapeCanvas: React.FC<{
                 }}
             />
 
+            {clipPath && bounds && (
+                <div
+                    onClick={(event) => {
+                        // A click on a vector belongs to the vector. Without
+                        // stopping here it would go on to the wrapper the
+                        // actionable's own selection toggle listens on, and one
+                        // click would pick the shape and the view behind it.
+                        event.stopPropagation();
+
+                        // In the element's own coordinates, which is what
+                        // `offsetX` reports — measured through whatever
+                        // transform the actionable and this canvas are drawn
+                        // under, so the point needs no unwinding here.
+                        const unit = Math.min(actionableSize.width, actionableSize.height);
+                        if (!(unit > 0)) return;
+
+                        const shape = hitTestShapes(shapes, {
+                            x: bounds.x + event.nativeEvent.offsetX / unit,
+                            y: bounds.y + event.nativeEvent.offsetY / unit
+                        });
+
+                        if (shape) onPick?.(shape);
+                    }}
+                    style={{
+                        position: "absolute",
+                        left: 0,
+                        top: 0,
+                        width: box.width,
+                        height: box.height,
+                        // Set here rather than inherited: the box around this is
+                        // backdrop and takes no presses, and a descendant asking
+                        // for them is how one part of it opts back in.
+                        pointerEvents: "auto",
+                        cursor: "pointer",
+                        clipPath
+                    }}
+                />
+            )}
+
             {selected && nodeId && hierarchyIdPrefix && (
                 <InertiaShapeChrome
                     shape={selected}
@@ -2461,6 +2524,7 @@ const InertiaShapeCanvas: React.FC<{
                     hierarchyIdPrefix={hierarchyIdPrefix}
                     actionableId={actionableId}
                     boxRef={boxRef}
+                    onPick={onPick}
                 />
             )}
         </div>
@@ -2490,7 +2554,11 @@ const InertiaShapeChrome: React.FC<{
     /// The instance this shape is drawn inside of.
     actionableId?: string;
     boxRef: React.RefObject<HTMLDivElement>;
-}> = ({ shape, nodeId, hierarchyIdPrefix, actionableId, boxRef }) => {
+    /// Puts this shape back down. The chrome covers the shape it belongs to and
+    /// sits above the layer a click would otherwise be picked off, so without
+    /// this there is no way to unpick a shape by clicking it.
+    onPick?: (shape: InertiaShape) => void;
+}> = ({ shape, nodeId, hierarchyIdPrefix, actionableId, boxRef, onPick }) => {
     const { inertiaDataModel } = useContext(InertiaContext)!;
     const inertiaCanvasSize = useContext(InertiaCanvasSizeContext);
     const controller = useContext(InertiaPlaybackContext);
@@ -2534,7 +2602,7 @@ const InertiaShapeChrome: React.FC<{
         });
     };
 
-    const { layoutBox, canDragBody, pointerHandlers, toolHandles } = useToolGesture({
+    const { layoutBox, moved, canDragBody, pointerHandlers, toolHandles } = useToolGesture({
         nodeId,
         elementRef: boxRef,
         initialValues,
@@ -2557,7 +2625,15 @@ const InertiaShapeChrome: React.FC<{
             // A press on a shape belongs to the shape. Without stopping here it
             // would go on to the wrapper the actionable's own drag listens on,
             // and one gesture would move both.
-            onClick={(e) => e.stopPropagation()}
+            //
+            // A click that never moved is a tap, and a tap on the shape being
+            // worked on puts it down — the same reading `handleClickToSelect`
+            // makes of a click on an actionable's body. Dragging the shape by
+            // this same box therefore does not unpick it.
+            onClick={(e) => {
+                e.stopPropagation();
+                if (!moved.current) onPick?.(shape);
+            }}
             style={{
                 position: "absolute",
                 left: 0,
@@ -2578,6 +2654,7 @@ const InertiaShapeChrome: React.FC<{
 const InertiaGuts: React.FC<DraggableProps> = React.memo(
   ({ hierarchyId, hierarchyIdPrefix, isSelected, containerRef, children, inertiaDataModel, toolHandles }) => {
     const controller = useContext(InertiaPlaybackContext);
+    const setInertiaDataModel = useContext(InertiaContext)?.setInertiaDataModel;
 
     // The controller writes this element's transform every frame it draws, so
     // registration is all there is to animating it.
@@ -2704,6 +2781,42 @@ const InertiaGuts: React.FC<DraggableProps> = React.memo(
       [shapes, isDrawnAlone]
     );
 
+    /// Picks a shape up, or puts it down again: the toggle a click on the
+    /// artwork runs, which is the same one a click on this node's own body runs
+    /// — see `handleClick` — and writes to the same selection.
+    ///
+    /// A shape travels as an `ActionableIdPair` like anything else: its own id
+    /// under the schema that carries it, which is how the editor's hierarchy
+    /// names it too, so picking a shape out here lights up the same row.
+    ///
+    /// The whole selection goes back on the wire rather than the one shape that
+    /// changed, because that is what a `MessageActionables` says: not what was
+    /// picked, but what *is* picked.
+    ///
+    /// Undefined outside actionable mode, which is what leaves the canvases
+    /// taking no clicks at all in a shipped build.
+    const pickShape = useMemo(() => {
+      if (!hierarchyIdPrefix || !setInertiaDataModel || !inertiaDataModel?.isActionable) {
+        return undefined;
+      }
+
+      return (shape: InertiaShape) => setInertiaDataModel(prev => {
+        const current = prev.actionableIdPairs ?? new Set<ActionableIdPair>();
+        const exists = Array.from(current).some(pair => pair.hierarchyId === shape.id);
+
+        const next = exists
+          ? new Set(Array.from(current).filter(pair => pair.hierarchyId !== shape.id))
+          : new Set([...Array.from(current), { hierarchyIdPrefix, hierarchyId: shape.id }]);
+
+        manager.sendMessageActionables({
+          tree: prev.tree,
+          actionableIds: Array.from(next),
+        });
+
+        return { ...prev, actionableIdPairs: next };
+      });
+    }, [hierarchyIdPrefix, setInertiaDataModel, inertiaDataModel?.isActionable]);
+
     /// One layer as a canvas: a shape drawn alone carries its own track and the
     /// editor's selection, and a shared run is the backdrop every shape here
     /// used to be part of.
@@ -2733,6 +2846,7 @@ const InertiaGuts: React.FC<DraggableProps> = React.memo(
           actionableId={alone ? hierarchyId : undefined}
           selected={isSelected ? alone : undefined}
           hidesBeforeAnimation={!!alone && alone.showsBeforeAnimation === false && !isSelected}
+          onPick={pickShape}
         />
       );
     };
