@@ -1,6 +1,6 @@
 import React from 'react'
 import {decode} from '@msgpack/msgpack'
-import {InertiaAnimationSchema, MessageTranslation, MessageActionables, MessageActionable, InertiaSchemaWrapper, InertiaAnimationInvokeType, WebSocketClient, InertiaDataModel, inertiaTree, inertiaTreeFor, inertiaSelection, inertiaSelectionReplacing, InertiaCanvasSize, MessageType, MessageWrapper, InertiaID, Tree, Node, ActionableIdPair, AnimationSignal, MessagePlaybackProgress, InertiaPlayback, authoredLoopDuration, valuesAtTime, sanitizeValues, InertiaShape, InertiaShapePosition, stackedShapes, Vertex, normalizedShapeTriangles, shapeBounds, hitTestShapes, shapeClipPath, inertiaFileExtension, InertiaTool, InertiaToolEdit, identityValues, noToolEdit, isNoToolEdit, addToolEdits, applyToolEdit, minimumToolScale, InertiaAnimationValues as InertiaAnimationValuesBase} from 'inertia-base'
+import {InertiaAnimationSchema, MessageTranslation, MessageActionables, MessageActionable, InertiaSchemaWrapper, InertiaAnimationInvokeType, WebSocketClient, InertiaDataModel, inertiaTree, inertiaTreeFor, treeFor, inertiaSelection, inertiaSelectionReplacing, InertiaCanvasSize, MessageType, MessageWrapper, InertiaID, Tree, Node, ActionableIdPair, AnimationSignal, MessagePlaybackProgress, InertiaPlayback, authoredLoopDuration, valuesAtTime, sanitizeValues, InertiaShape, InertiaShapePosition, stackedShapes, Vertex, normalizedShapeTriangles, shapeBounds, hitTestShapes, shapeClipPath, inertiaFileExtension, InertiaTool, InertiaToolEdit, identityValues, noToolEdit, isNoToolEdit, addToolEdits, applyToolEdit, minimumToolScale, InertiaAnimationValues as InertiaAnimationValuesBase} from 'inertia-base'
 
 export type InertiaContainerProps = {
     children: React.ReactElement,
@@ -138,6 +138,16 @@ class SharedIndexManager {
     public indexMap: Record<string, number> = {};
     public objectIndexMap: Record<string, number> = {};
     public objectIdSet: Set<string> = new Set();
+    /// Indices handed back by nodes that have gone away, per counter — see
+    /// `releaseId`.
+    private freeIndices: Record<string, number[]> = {};
+
+    /// Separated, or container `ab` with prefix `c` and container `a` with
+    /// prefix `bc` would share a counter. The separator is a character no
+    /// authored id can hold, which is what makes the two halves unambiguous.
+    private static key(containerId: string | undefined | null, prefix: string): string {
+        return `${containerId ?? ""}${prefix}`;
+    }
 
     /// Names the next instance of `prefix` in this container, and moves the
     /// counter along.
@@ -148,11 +158,46 @@ class SharedIndexManager {
     /// the second container's node come up as `card0--1` with no `card0--0`
     /// beside it, so a selection authored against the first container named
     /// nothing the second one drew.
+    ///
+    /// A released index is handed out again before a fresh one is taken, so a
+    /// container gives the same names to the same views every time it draws
+    /// them — see `releaseId`.
     public claimId(containerId: string | undefined | null, prefix: string): string {
-        const key = `${containerId ?? ""}${prefix}`;
+        const key = SharedIndexManager.key(containerId, prefix);
+
+        const free = this.freeIndices[key];
+        if (free && free.length > 0) {
+            free.sort((a, b) => a - b);
+            return `${prefix}--${free.shift()!}`;
+        }
+
         const index = this.indexMap[key] ?? 0;
         this.indexMap[key] = index + 1;
         return `${prefix}--${index}`;
+    }
+
+    /// Gives an index back, for the next view of this prefix in this container
+    /// to take.
+    ///
+    /// The counter alone only ever climbs, and on this runtime a view that goes
+    /// off screen is unmounted rather than kept alive the way SwiftUI's
+    /// `TabView` keeps a tab that is not the selected one — so a tab visited a
+    /// second time had its cards come back as `card0--1` and `card1--1`.
+    /// Everything the editor holds is filed under the name the node had the
+    /// first time: its row in the hierarchy, the selection, the mapping from
+    /// actionable to animation. The second visit drew views the editor had
+    /// never heard of, in a hierarchy still listing rows nothing on screen
+    /// answered to.
+    public releaseId(containerId: string | undefined | null, prefix: string, id: string): void {
+        const separator = `${prefix}--`;
+        if (!id.startsWith(separator)) return;
+
+        const index = Number(id.slice(separator.length));
+        if (!Number.isInteger(index)) return;
+
+        const key = SharedIndexManager.key(containerId, prefix);
+        const free = this.freeIndices[key] ?? (this.freeIndices[key] = []);
+        if (!free.includes(index)) free.push(index);
     }
 }
 
@@ -967,6 +1012,11 @@ export const InertiaContainer = ({ children, dev, id, hierarchyId, baseURL }: In
         new InertiaDataModel(id, new Map())
     );
     const [bounds, setBounds] = React.useState<InertiaCanvasSize | null>(null);
+    /// The hierarchies this container has built, one per `hierarchyId` it has
+    /// been given. Made once and mutated in place, so it is what an effect that
+    /// must not be torn down by an unrelated model update keys on — the model
+    /// around it is replaced on every write.
+    const trees = inertiaDataModel.trees;
     const ref = React.useRef<HTMLDivElement | null>(null);
     const controllerRef = React.useRef<InertiaPlaybackController | null>(null);
     if (controllerRef.current === null) {
@@ -1102,12 +1152,6 @@ export const InertiaContainer = ({ children, dev, id, hierarchyId, baseURL }: In
             return;
         }
 
-        // Made here rather than waited for. This container's hierarchy is empty
-        // until an actionable inside it registers, and that happens after this
-        // runs — so asking only for a tree that already exists meant the socket
-        // was never dialed at all.
-        const tree = inertiaTreeFor(inertiaDataModel, hierarchyId);
-
         // Where the editor's playhead comes from. Set before connecting: a run
         // can be under way before the socket is up, and reports are dropped
         // rather than queued while it is not.
@@ -1165,13 +1209,69 @@ export const InertiaContainer = ({ children, dev, id, hierarchyId, baseURL }: In
                 setInertiaDataModel(prev => ({ ...prev, activeTool: tool }));
             };
 
-            console.log(`[INERTIA_LOG]: Sending initial MessageActionables`);
+        });
+    }, [trees, hierarchyId, dev, controller]);
+
+    /// What the editor draws its hierarchy panel from.
+    ///
+    /// The selection as it stands when the message goes out rather than as it
+    /// was when this was set up: the two halves of a `MessageActionables` are
+    /// read together, and sending a stale selection beside a fresh tree tells the
+    /// editor that what the user picked a moment ago is no longer picked.
+    const selectionRef = React.useRef<Set<ActionableIdPair>>(new Set());
+    selectionRef.current = inertiaSelection(inertiaDataModel, hierarchyId);
+
+    /// Tells the editor what this container is showing, whenever that changes.
+    ///
+    /// A hierarchy is not built in one go — each actionable registers as it
+    /// mounts, which is after this container's effects have run — so a message
+    /// sent only when the socket opens carried whatever had registered by then.
+    /// With a container whose `hierarchyId` changes, that is nothing at all: the
+    /// tab being opened has its own empty tree at that moment, and the editor
+    /// was left drawing the panel for a hierarchy it was never told the contents
+    /// of.
+    ///
+    /// Coalesced to one message per microtask, because a screen's worth of
+    /// actionables register one after another within a single commit and the
+    /// editor only wants the hierarchy they add up to.
+    React.useEffect(() => {
+        if (!dev || !trees) return;
+
+        const ws = WebSocketClient.shared;
+        const tree = treeFor(trees, hierarchyId);
+
+        const send = () => {
             ws.sendMessageActionables({
                 tree,
-                actionableIds: Array.from(inertiaSelection(inertiaDataModel, hierarchyId)),
+                actionableIds: Array.from(selectionRef.current),
             });
-        });
-    }, [inertiaDataModel?.trees, hierarchyId, dev, controller]);
+        };
+
+        let isScheduled = false;
+        const schedule = () => {
+            if (isScheduled) return;
+            isScheduled = true;
+            queueMicrotask(() => {
+                isScheduled = false;
+                send();
+            });
+        };
+
+        const unsubscribe = tree.subscribe(schedule);
+        // An editor that attaches later missed everything said before it was
+        // listening, and the hierarchy will not change again just because one
+        // turned up.
+        const stopListening = ws.addConnectedListener(send);
+
+        // What this container is showing as of now, for the hierarchy it has
+        // just switched to.
+        schedule();
+
+        return () => {
+            unsubscribe();
+            stopListening();
+        };
+    }, [trees, hierarchyId, dev]);
 
     return (
         <InertiaCanvasSizeContext.Provider value={bounds}>
@@ -2970,34 +3070,55 @@ export const Inertia: React.FC<InertiaProps> = ({ children, id }) => {
   const [edit, setEdit] = useState<InertiaToolEdit>(noToolEdit);
   /// This instance's own id: the authored id plus its index among its siblings.
   const [instanceId, setInstanceId] = useState<string>();
-  /// The id this instance claimed, kept out of state so the effect that claims
-  /// it can see it has already run — see the effect below.
-  const claimedIdRef = useRef<string>();
 
-  /// Claimed once and never re-claimed. This effect runs again whenever the
-  /// component remounts — a tab switch is one, and React's dev-mode double
-  /// invoke is another — and taking a fresh index each time renamed a node that
-  /// had not moved. Everything already filed under the old name — the node in
-  /// the tree, the selection the editor is holding, the registration with the
-  /// playback controller — went on naming a view that no longer answered to it.
+  /// Held for as long as this node is mounted in this container, and handed back
+  /// when it is not.
+  ///
+  /// The index used to be claimed once and kept in a ref so a remount would not
+  /// take a second one — which a ref cannot do, because an unmount throws the
+  /// ref away with the rest of the component. Nothing was holding a name still;
+  /// the counter simply climbed, and a tab that had been away came back under
+  /// ids the editor had never been told about.
+  ///
+  /// Releasing is what keeps the name still instead: the index goes back to the
+  /// container it was taken from, and the next view of this prefix to mount
+  /// there — which, on a tab switched back to, is this same view — takes it
+  /// again. React runs every cleanup in a commit before any of that commit's
+  /// effects, so the tab being left has given its indices back before the tab
+  /// being opened asks for one.
   useEffect(() => {
-    if (claimedIdRef.current) {
-      setInstanceId(claimedIdRef.current);
-      return;
-    }
+    const claimedId = indexManager.claimId(inertiaContainerId, hierarchyIdPrefix);
+    setInstanceId(claimedId);
 
-    const newId = indexManager.claimId(inertiaContainerId, hierarchyIdPrefix);
-    claimedIdRef.current = newId;
-    setInstanceId(newId);
-  }, [hierarchyIdPrefix, inertiaContainerId]);
+    return () => {
+      indexManager.releaseId(inertiaContainerId, hierarchyIdPrefix, claimedId);
+    };
+  }, [indexManager, hierarchyIdPrefix, inertiaContainerId]);
+
+  /// This node's place in its container's hierarchy, for as long as it is in it.
+  ///
+  /// Taken out again on the way off screen: this runtime unmounts a view that is
+  /// not on the selected tab rather than keeping it alive, so a hierarchy that
+  /// only ever grew described an app that no longer existed — see
+  /// `Tree.removeNode`.
+  ///
+  /// Keyed on the map of hierarchies rather than on the model holding it: the
+  /// model is replaced on every write, and an effect that tore this down and
+  /// rebuilt it whenever anything else changed would take the node out of the
+  /// tree and put it back on every selection.
+  const trees = inertiaDataModel?.trees;
 
   useEffect(() => {
-    if (!instanceId || !inertiaDataModel || !inertiaContainerId) return;
+    if (!instanceId || !trees || !inertiaContainerId) return;
 
     // Into this container's own hierarchy — see `InertiaDataModel.trees`.
-    inertiaTreeFor(inertiaDataModel, inertiaContainerId)
-      .addRelationship(instanceId, inertiaParentId, inertiaIsContainer);
-  }, [instanceId, inertiaParentId, inertiaIsContainer, inertiaContainerId, inertiaDataModel]);
+    const tree = treeFor(trees, inertiaContainerId);
+    tree.addRelationship(instanceId, inertiaParentId, inertiaIsContainer);
+
+    return () => {
+      tree.removeNode(instanceId);
+    };
+  }, [instanceId, inertiaParentId, inertiaIsContainer, inertiaContainerId, trees]);
 
   /// The values the schema starts this actionable at. The playback controller
   /// writes them as the node's own transform, so the edit that sits on top of
