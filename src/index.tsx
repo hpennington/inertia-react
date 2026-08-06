@@ -1,6 +1,6 @@
 import React from 'react'
 import {decode} from '@msgpack/msgpack'
-import {InertiaAnimationSchema, MessageTranslation, MessageActionables, MessageActionable, InertiaSchemaWrapper, InertiaAnimationInvokeType, WebSocketClient, InertiaDataModel, InertiaCanvasSize, MessageType, MessageWrapper, InertiaID, Tree, Node, ActionableIdPair, AnimationSignal, MessagePlaybackProgress, InertiaPlayback, authoredLoopDuration, valuesAtTime, sanitizeValues, InertiaShape, InertiaShapePosition, stackedShapes, Vertex, normalizedShapeTriangles, shapeBounds, hitTestShapes, shapeClipPath, inertiaFileExtension, InertiaTool, InertiaToolEdit, identityValues, noToolEdit, isNoToolEdit, addToolEdits, applyToolEdit, minimumToolScale, InertiaAnimationValues as InertiaAnimationValuesBase} from 'inertia-base'
+import {InertiaAnimationSchema, MessageTranslation, MessageActionables, MessageActionable, InertiaSchemaWrapper, InertiaAnimationInvokeType, WebSocketClient, InertiaDataModel, inertiaTree, inertiaTreeFor, inertiaSelection, inertiaSelectionReplacing, InertiaCanvasSize, MessageType, MessageWrapper, InertiaID, Tree, Node, ActionableIdPair, AnimationSignal, MessagePlaybackProgress, InertiaPlayback, authoredLoopDuration, valuesAtTime, sanitizeValues, InertiaShape, InertiaShapePosition, stackedShapes, Vertex, normalizedShapeTriangles, shapeBounds, hitTestShapes, shapeClipPath, inertiaFileExtension, InertiaTool, InertiaToolEdit, identityValues, noToolEdit, isNoToolEdit, addToolEdits, applyToolEdit, minimumToolScale, InertiaAnimationValues as InertiaAnimationValuesBase} from 'inertia-base'
 
 export type InertiaContainerProps = {
     children: React.ReactElement,
@@ -138,6 +138,22 @@ class SharedIndexManager {
     public indexMap: Record<string, number> = {};
     public objectIndexMap: Record<string, number> = {};
     public objectIdSet: Set<string> = new Set();
+
+    /// Names the next instance of `prefix` in this container, and moves the
+    /// counter along.
+    ///
+    /// Counted per container rather than per prefix alone: the index is what
+    /// tells two instances of the same authored view apart, and two containers
+    /// each holding one instance are not two instances. Sharing one counter had
+    /// the second container's node come up as `card0--1` with no `card0--0`
+    /// beside it, so a selection authored against the first container named
+    /// nothing the second one drew.
+    public claimId(containerId: string | undefined | null, prefix: string): string {
+        const key = `${containerId ?? ""}${prefix}`;
+        const index = this.indexMap[key] ?? 0;
+        this.indexMap[key] = index + 1;
+        return `${prefix}--${index}`;
+    }
 }
 
 // ------------------ Playback ------------------
@@ -948,7 +964,7 @@ const InertiaAlignmentGrid: React.FC<{ store: InertiaGuideStore }> = ({ store })
 
 export const InertiaContainer = ({ children, dev, id, hierarchyId, baseURL }: InertiaContainerProps): React.ReactElement => {
     const [inertiaDataModel, setInertiaDataModel] = React.useState(
-        new InertiaDataModel(id, new Map(), new Tree(id), new Set())
+        new InertiaDataModel(id, new Map())
     );
     const [bounds, setBounds] = React.useState<InertiaCanvasSize | null>(null);
     const ref = React.useRef<HTMLDivElement | null>(null);
@@ -1081,10 +1097,16 @@ export const InertiaContainer = ({ children, dev, id, hierarchyId, baseURL }: In
         }
 
         const ws = WebSocketClient.shared;
-        if (!inertiaDataModel?.tree) {
-            console.log(`[INERTIA_LOG]: No tree in inertiaDataModel, skipping WebSocket connection`);
+        if (!inertiaDataModel) {
+            console.log(`[INERTIA_LOG]: No inertiaDataModel, skipping WebSocket connection`);
             return;
         }
+
+        // Made here rather than waited for. This container's hierarchy is empty
+        // until an actionable inside it registers, and that happens after this
+        // runs — so asking only for a tree that already exists meant the socket
+        // was never dialed at all.
+        const tree = inertiaTreeFor(inertiaDataModel, hierarchyId);
 
         // Where the editor's playhead comes from. Set before connecting: a run
         // can be under way before the socket is up, and reports are dropped
@@ -1097,8 +1119,13 @@ export const InertiaContainer = ({ children, dev, id, hierarchyId, baseURL }: In
         ws.connect("ws://127.0.0.1:8080", () => {
             console.log(`[INERTIA_LOG]: WebSocket connected, setting up handlers`);
 
-            ws.messageReceived = (msg) => {
-              console.log(`[INERTIA_LOG]: Received messageReceived with ${msg.size} IDs`);
+            // Filed under the hierarchy the editor named rather than over the
+            // whole app: the editor draws one panel per hierarchy and writes a
+            // selection back through the packet it was made in, so a message is
+            // about one container. Laid over everything, picking a row in one
+            // container silently cleared what was picked in every other.
+            ws.messageReceived = (treeId, msg) => {
+              console.log(`[INERTIA_LOG]: Received messageReceived for ${treeId} with ${msg.size} IDs`);
 
               setInertiaDataModel(prev => {
                 const newPairs = new Set<ActionableIdPair>();
@@ -1111,7 +1138,10 @@ export const InertiaContainer = ({ children, dev, id, hierarchyId, baseURL }: In
 
                 console.log("[INERTIA_LOG]: ✅ Updating actionableIdPairs from WS:", Array.from(newPairs));
 
-                return { ...prev, actionableIdPairs: newPairs };
+                return {
+                  ...prev,
+                  actionableIdPairsByContainer: inertiaSelectionReplacing(prev, treeId, newPairs),
+                };
               });
             };
 
@@ -1137,11 +1167,11 @@ export const InertiaContainer = ({ children, dev, id, hierarchyId, baseURL }: In
 
             console.log(`[INERTIA_LOG]: Sending initial MessageActionables`);
             ws.sendMessageActionables({
-                tree: inertiaDataModel.tree,
-                actionableIds: Array.from(inertiaDataModel.actionableIdPairs),
+                tree,
+                actionableIds: Array.from(inertiaSelection(inertiaDataModel, hierarchyId)),
             });
         });
-    }, [inertiaDataModel?.tree, dev, controller]);
+    }, [inertiaDataModel?.trees, hierarchyId, dev, controller]);
 
     return (
         <InertiaCanvasSizeContext.Provider value={bounds}>
@@ -2655,6 +2685,7 @@ const InertiaGuts: React.FC<DraggableProps> = React.memo(
   ({ hierarchyId, hierarchyIdPrefix, isSelected, containerRef, children, inertiaDataModel, toolHandles }) => {
     const controller = useContext(InertiaPlaybackContext);
     const setInertiaDataModel = useContext(InertiaContext)?.setInertiaDataModel;
+    const inertiaContainerId = useContext(InertiaContainerIdContext);
 
     // The controller writes this element's transform every frame it draws, so
     // registration is all there is to animating it.
@@ -2737,8 +2768,8 @@ const InertiaGuts: React.FC<DraggableProps> = React.memo(
     /// not on the wire: both ends hold the schemas and resolve it by looking.
     const selectedShapeIds = useMemo(() => {
       if (!inertiaDataModel?.isActionable) return new Set<string>();
-      return new Set(Array.from(inertiaDataModel.actionableIdPairs ?? []).map(pair => pair.hierarchyId));
-    }, [inertiaDataModel?.isActionable, inertiaDataModel?.actionableIdPairs]);
+      return new Set(Array.from(inertiaSelection(inertiaDataModel, inertiaContainerId)).map(pair => pair.hierarchyId));
+    }, [inertiaDataModel?.isActionable, inertiaDataModel?.actionableIdPairsByContainer, inertiaContainerId]);
 
     /// Whether a shape is drawn on a canvas of its own rather than sharing the
     /// backdrop.
@@ -2796,26 +2827,35 @@ const InertiaGuts: React.FC<DraggableProps> = React.memo(
     /// Undefined outside actionable mode, which is what leaves the canvases
     /// taking no clicks at all in a shipped build.
     const pickShape = useMemo(() => {
-      if (!hierarchyIdPrefix || !setInertiaDataModel || !inertiaDataModel?.isActionable) {
+      if (!hierarchyIdPrefix || !setInertiaDataModel || !inertiaContainerId || !inertiaDataModel?.isActionable) {
         return undefined;
       }
 
       return (shape: InertiaShape) => setInertiaDataModel(prev => {
-        const current = prev.actionableIdPairs ?? new Set<ActionableIdPair>();
+        const current = inertiaSelection(prev, inertiaContainerId);
         const exists = Array.from(current).some(pair => pair.hierarchyId === shape.id);
 
         const next = exists
           ? new Set(Array.from(current).filter(pair => pair.hierarchyId !== shape.id))
           : new Set([...Array.from(current), { hierarchyIdPrefix, hierarchyId: shape.id }]);
 
-        manager.sendMessageActionables({
-          tree: prev.tree,
-          actionableIds: Array.from(next),
-        });
+        // This container's own tree and its own selection, never the app's: the
+        // two halves of a `MessageActionables` are read together, and the editor
+        // files what it is told under the tree that came with it.
+        const tree = inertiaTree(prev, inertiaContainerId);
+        if (tree) {
+          manager.sendMessageActionables({
+            tree,
+            actionableIds: Array.from(next),
+          });
+        }
 
-        return { ...prev, actionableIdPairs: next };
+        return {
+          ...prev,
+          actionableIdPairsByContainer: inertiaSelectionReplacing(prev, inertiaContainerId, next),
+        };
       });
-    }, [hierarchyIdPrefix, setInertiaDataModel, inertiaDataModel?.isActionable]);
+    }, [hierarchyIdPrefix, setInertiaDataModel, inertiaContainerId, inertiaDataModel?.isActionable]);
 
     /// One layer as a canvas: a shape drawn alone carries its own track and the
     /// editor's selection, and a shared run is the backdrop every shape here
@@ -2923,26 +2963,41 @@ export const Inertia: React.FC<InertiaProps> = ({ children, id }) => {
   const { inertiaDataModel, setInertiaDataModel } = useContext(InertiaContext)!;
   const inertiaParentId = useContext(InertiaParentIdContext)!;
   const inertiaIsContainer = useContext(InertiaIsContainerContext)!;
+  const inertiaContainerId = useContext(InertiaContainerIdContext);
   const indexManager = SharedIndexManager.shared;
   const containerRef = useRef<HTMLDivElement>(null);
 
   const [edit, setEdit] = useState<InertiaToolEdit>(noToolEdit);
   /// This instance's own id: the authored id plus its index among its siblings.
   const [instanceId, setInstanceId] = useState<string>();
+  /// The id this instance claimed, kept out of state so the effect that claims
+  /// it can see it has already run — see the effect below.
+  const claimedIdRef = useRef<string>();
 
+  /// Claimed once and never re-claimed. This effect runs again whenever the
+  /// component remounts — a tab switch is one, and React's dev-mode double
+  /// invoke is another — and taking a fresh index each time renamed a node that
+  /// had not moved. Everything already filed under the old name — the node in
+  /// the tree, the selection the editor is holding, the registration with the
+  /// playback controller — went on naming a view that no longer answered to it.
   useEffect(() => {
-    const indexValue = indexManager.indexMap[hierarchyIdPrefix] ?? 0;
-
-    const newId = `${hierarchyIdPrefix}--${indexValue}`;
-    indexManager.indexMap[hierarchyIdPrefix] = indexValue + 1;
-    setInstanceId(newId);
-  }, [hierarchyIdPrefix]);
-
-  useEffect(() => {
-    if (instanceId) {
-      inertiaDataModel?.tree.addRelationship(instanceId, inertiaParentId, inertiaIsContainer);
+    if (claimedIdRef.current) {
+      setInstanceId(claimedIdRef.current);
+      return;
     }
-  }, [instanceId, inertiaParentId, inertiaIsContainer]);
+
+    const newId = indexManager.claimId(inertiaContainerId, hierarchyIdPrefix);
+    claimedIdRef.current = newId;
+    setInstanceId(newId);
+  }, [hierarchyIdPrefix, inertiaContainerId]);
+
+  useEffect(() => {
+    if (!instanceId || !inertiaDataModel || !inertiaContainerId) return;
+
+    // Into this container's own hierarchy — see `InertiaDataModel.trees`.
+    inertiaTreeFor(inertiaDataModel, inertiaContainerId)
+      .addRelationship(instanceId, inertiaParentId, inertiaIsContainer);
+  }, [instanceId, inertiaParentId, inertiaIsContainer, inertiaContainerId, inertiaDataModel]);
 
   /// The values the schema starts this actionable at. The playback controller
   /// writes them as the node's own transform, so the edit that sits on top of
@@ -2973,28 +3028,36 @@ export const Inertia: React.FC<InertiaProps> = ({ children, id }) => {
     initialValues?.opacity,
   ])
 
-  const isSelected = instanceId ? Array.from(inertiaDataModel?.actionableIdPairs ?? []).some(pair => pair.hierarchyId === instanceId) : false;
+  const isSelected = instanceId
+    ? Array.from(inertiaSelection(inertiaDataModel, inertiaContainerId)).some(pair => pair.hierarchyId === instanceId)
+    : false;
 
   const handleClick = () => {
-  if (!instanceId || !hierarchyIdPrefix || !inertiaDataModel?.isActionable) return;
+  if (!instanceId || !hierarchyIdPrefix || !inertiaContainerId || !inertiaDataModel?.isActionable) return;
 
   const pair: ActionableIdPair = { hierarchyIdPrefix, hierarchyId: instanceId };
 
   setInertiaDataModel(prev => {
-    const currentPairs = prev.actionableIdPairs ?? new Set<ActionableIdPair>();
+    const currentPairs = inertiaSelection(prev, inertiaContainerId);
     const exists = Array.from(currentPairs).some(p => p.hierarchyId === instanceId);
 
     const newPairs = exists
       ? new Set(Array.from(currentPairs).filter(p => p.hierarchyId !== instanceId))
       : new Set([...Array.from(currentPairs), pair]);
 
-    // Send update outside of setState for clarity
-    manager.sendMessageActionables({
-      tree: prev.tree,
-      actionableIds: Array.from(newPairs),
-    });
+    // This container's own tree and its own selection — see `pickShape`.
+    const tree = inertiaTree(prev, inertiaContainerId);
+    if (tree) {
+      manager.sendMessageActionables({
+        tree,
+        actionableIds: Array.from(newPairs),
+      });
+    }
 
-    return { ...prev, actionableIdPairs: newPairs };
+    return {
+      ...prev,
+      actionableIdPairsByContainer: inertiaSelectionReplacing(prev, inertiaContainerId, newPairs),
+    };
   });
 };
 
@@ -3009,7 +3072,7 @@ export const Inertia: React.FC<InertiaProps> = ({ children, id }) => {
       containerRef={containerRef}
       children={children}
       inertiaDataModel={inertiaDataModel}
-      actionableIdPairs={inertiaDataModel?.actionableIdPairs}
+      actionableIdPairs={inertiaSelection(inertiaDataModel, inertiaContainerId)}
       edit={edit}
       setEdit={setEdit}
       initialValues={initialValues ?? undefined}
