@@ -232,6 +232,16 @@ type ActionableState = {
     /// and resume a run, but starting one is the app's call.
     trigger: boolean;
     isCancelled: boolean;
+    /// Where the track is frozen after a triggered run has had its pass, in
+    /// seconds into the loop — null while the animation is waiting, running, or
+    /// being scrubbed.
+    ///
+    /// Ending a pass clears `trigger`, so the animation can be asked for again;
+    /// on its own that would also take the node back to its initial values,
+    /// since nothing but a running track draws anywhere else. It stays where the
+    /// run left it instead, which is this: the frame it was showing when the
+    /// pass ended, held until it is triggered again.
+    heldTime?: number | null;
 };
 
 /// Owns the clock every actionable in a container is drawn from.
@@ -312,24 +322,13 @@ export class InertiaPlaybackController {
         this.render();
     }
 
-    /// Whether the editor has asked for playback and not since paused it.
-    ///
-    /// Held across schema arrivals because the two race. The editor sends the
-    /// schemas and then `resume` straight after, but a schema message only
-    /// reaches this controller through a React re-render and the effect that
-    /// follows it, while a signal is applied the moment it arrives — so `resume`
-    /// lands first, against a `states` map that is still empty, and there is
-    /// nothing for it to start. Remembering the request lets the schemas start
-    /// themselves when they turn up a tick later.
-    private isEditorPlaying: boolean = false;
-
     /// Replaces the schemas, keyed by hierarchy id prefix.
     ///
-    /// `auto` animations start as soon as their schema arrives — as does
-    /// everything else while the editor is playing, since authoring a `trigger`
-    /// animation is exactly when nothing is going to call `trigger()` for it.
-    /// Neither happens if the editor has parked the playhead, where starting a
-    /// run would take it away from whoever is scrubbing.
+    /// `auto` animations start as soon as their schema arrives — the same set
+    /// with the editor attached as without, which is what settles the race
+    /// between a `resume` and the schemas it was sent alongside. Not if the
+    /// editor has parked the playhead, where starting a run would take it away
+    /// from whoever is scrubbing.
     ///
     /// An animation that is no longer in the set loses its playback state along
     /// with its track, rather than being left behind marked as running. Nothing
@@ -375,10 +374,13 @@ export class InertiaPlaybackController {
                 this.states.set(prefix, { trigger: false, isCancelled: false });
             }
 
-            if (schema.invokeType === InertiaAnimationInvokeType.auto || this.isEditorPlaying) {
+            if (schema.invokeType === InertiaAnimationInvokeType.auto) {
                 const state = this.states.get(prefix)!;
                 if (!state.isCancelled && !state.trigger) {
                     state.trigger = true;
+                    // Playing again is what lets go of the frame a finished pass
+                    // was left holding.
+                    state.heldTime = null;
                     didTrigger = true;
                 }
             }
@@ -508,6 +510,11 @@ export class InertiaPlaybackController {
         this.stopClock();
         this.playheadTime = 0;
 
+        // The playhead is back at zero, which ends the pass of anything else
+        // that was triggered — the same rule as everywhere else, so a restart
+        // does not quietly carry another animation's run over the boundary.
+        this.retireTriggeredAnimations(0);
+
         this.start(id);
     }
 
@@ -524,9 +531,8 @@ export class InertiaPlaybackController {
     /// `trigger()` call a `trigger` animation is still waiting for, and starting
     /// one here played animations the app had said it would start itself. Those
     /// are returned to their initial values instead, so the screen offers them
-    /// from the top when the app does trigger them. The editor's play button
-    /// does stand in for the app, which is what `isEditorPlaying` keeps true
-    /// here.
+    /// from the top when the app does trigger them — the editor's Trigger action
+    /// included, which is a `trigger()` call like any other.
     ///
     /// Every schema as well as every state, since an animation that has never
     /// run has no state to rewind and is exactly the one this has to start. A
@@ -540,8 +546,7 @@ export class InertiaPlaybackController {
         let didStart = false;
 
         new Set([...this.states.keys(), ...this.schemas.keys()]).forEach(prefix => {
-            const isAuto = this.schemas.get(prefix)?.invokeType === InertiaAnimationInvokeType.auto
-                || this.isEditorPlaying;
+            const isAuto = this.schemas.get(prefix)?.invokeType === InertiaAnimationInvokeType.auto;
 
             this.states.set(prefix, { trigger: isAuto, isCancelled: false });
             didStart = didStart || isAuto;
@@ -565,9 +570,74 @@ export class InertiaPlaybackController {
     }
 
     private start(id: string): void {
-        this.states.set(id, { trigger: true, isCancelled: false });
+        this.states.set(id, { trigger: true, isCancelled: false, heldTime: null });
         this.seekTime = null;
         this.startClock();
+    }
+
+    /// Puts the `trigger` animations that have played their pass back to
+    /// waiting, holding each where `time` leaves it.
+    ///
+    /// A trigger is answered once. The run it asked for ends when the playhead
+    /// goes back to zero — the loop coming round, or the editor's transport
+    /// being touched — and the animation has to be asked for again, rather than
+    /// repeating for as long as the screen is up with a second `trigger()` left
+    /// with nothing to do.
+    ///
+    /// What ends is the run, not what is on screen: `heldTime` is the frame the
+    /// animation was showing at that moment, and it stays on it until the next
+    /// trigger replays it. Every caller passes the playhead the node is drawn
+    /// at, so nothing moves at the instant a pass ends.
+    ///
+    /// The clock goes down with the last thing running off it, the same as a
+    /// cancellation. Reporting that is left to the caller, each of which is
+    /// about to say something about the run anyway.
+    private retireTriggeredAnimations(time: number): void {
+        this.states.forEach((state, prefix) => {
+            if (this.schemas.get(prefix)?.invokeType !== InertiaAnimationInvokeType.trigger) {
+                return;
+            }
+
+            if (!state.trigger) {
+                return;
+            }
+
+            state.trigger = false;
+            state.heldTime = time;
+        });
+
+        if (this.hasTriggeredActionable) {
+            return;
+        }
+
+        this.stopClock();
+    }
+
+    /// Where to read `prefix`'s track, or null when its run is not on screen at
+    /// all and the animation is drawn at the values it starts from.
+    ///
+    /// The one answer to both halves of that question, so whether a track shows
+    /// and where it has got to can never disagree. Three states in it: a run on
+    /// screen — playing, or parked in the track by the editor — reads at the
+    /// playhead; a triggered run that has had its pass holds the frame it ended
+    /// on, whatever the playhead does afterwards, until it is triggered again;
+    /// anything else is not drawn from its track.
+    private trackTime(prefix: string): number | null {
+        const state = this.states.get(prefix);
+        if (!state || state.isCancelled) {
+            return null;
+        }
+
+        if (state.heldTime !== null && state.heldTime !== undefined) {
+            return state.heldTime;
+        }
+
+        // Scrubbing shows the animation without running it.
+        if (!state.trigger || (!this.isRunning && this.seekTime === null)) {
+            return null;
+        }
+
+        return this.seekTime ?? this.playheadTime;
     }
 
     // MARK: - Editor signals
@@ -589,50 +659,74 @@ export class InertiaPlaybackController {
                 this.loopDuration = InertiaPlayback.clampLoopDuration(signal.duration);
                 this.render();
                 break;
+            // The app's own entry point, reached by the editor's Trigger action
+            // standing in for the app — a `trigger` animation starts the one way
+            // whoever is watching it in the editor is authoring it to start.
+            case "trigger":
+                this.trigger(signal.id);
+                break;
         }
     }
 
     /// Stops the run and reports where it stopped, so a paused playhead sits
-    /// exactly where the animation froze.
+    /// exactly where the animation froze — for the `auto` animations. A
+    /// triggered one has had its pass ended by the transport being touched at
+    /// all, so it holds the frame it is on until it is asked for again.
     private pausePlayback(): void {
-        this.isEditorPlaying = false;
+        this.retireTriggeredAnimations(this.playheadTime);
         this.stopClock();
         this.seekTime = this.playheadTime;
         this.render();
         this.report(false);
     }
 
-    /// The editor's play button: runs every animation, whatever its
-    /// `invokeType`, picking a paused or scrubbed run back up where it was left.
+    /// The editor's play button: picks a paused or scrubbed run back up where it
+    /// was left, and starts the animations that start themselves.
     ///
-    /// `auto` animations are already going by the time this arrives — those
-    /// start as soon as their schema does. A `trigger` animation is waiting on
-    /// the app to call `trigger()`, which is not something the app does while
-    /// its animation is being authored, so the editor stands in for the app and
-    /// starts it here. Signals only ever come from the editor, so the same
-    /// animation running without the editor attached still waits for its
-    /// trigger.
+    /// The `auto` ones, which mostly started as soon as their schema did. A
+    /// `trigger` animation goes on waiting for the app to call `trigger()` — and
+    /// one that was mid-pass is put back to waiting, since pressing play is
+    /// asking for the run the timeline describes rather than for the one a
+    /// trigger asked for. Standing in for the app is the editor's Trigger
+    /// action's job, and it arrives as its own signal rather than riding along
+    /// with this.
     ///
     /// Cancelled animations are left where they are: stopping one is the app's
     /// call, and picking it back up is `restart()`'s.
     private resumePlayback(): void {
-        this.isEditorPlaying = true;
+        const wasRunning = this.isRunning;
+
         // Unparked before the bail-out below, not after: a play following a
         // pause has to release the playhead even when the schemas it applies to
         // have not arrived yet, or `setSchemas` finds it still parked and
         // declines to start the run.
         this.seekTime = null;
 
-        this.states.forEach(state => {
-            if (!state.isCancelled) {
-                state.trigger = true;
+        this.retireTriggeredAnimations(this.playheadTime);
+
+        this.schemas.forEach((schema, prefix) => {
+            if (schema.invokeType !== InertiaAnimationInvokeType.auto) {
+                return;
             }
+
+            const state = this.states.get(prefix);
+            if (!state || state.isCancelled || state.trigger) {
+                return;
+            }
+
+            state.trigger = true;
+            state.heldTime = null;
         });
 
-        // Nothing to play yet: the schemas this request arrived ahead of will
+        // Nothing to play: either the schemas this request arrived ahead of will
         // start themselves in `setSchemas`, which is where the race above is
-        // settled.
+        // settled, or everything here is waiting on a trigger this is not —
+        // worth saying if it means a run just ended.
         if (!this.hasTriggeredActionable) {
+            this.render();
+            if (wasRunning) {
+                this.report(false);
+            }
             return;
         }
 
@@ -646,6 +740,13 @@ export class InertiaPlaybackController {
         this.stopClock();
 
         const clamped = Math.min(Math.max(time, 0), this.playbackDuration);
+
+        // Back at the start of the timeline, which is where a pass ends however
+        // the playhead got there — see `retireTriggeredAnimations`.
+        if (clamped === 0) {
+            this.retireTriggeredAnimations(0);
+        }
+
         this.seekTime = clamped;
         this.playheadTime = clamped;
         this.render();
@@ -703,7 +804,9 @@ export class InertiaPlaybackController {
 
         // A run that plays once ends here, holding its final frame: no further
         // frame is requested, but `isRunning` stays set so the run stays on
-        // screen. Starting it again is the app's call.
+        // screen. Starting it again is the app's call. Nothing retires here,
+        // because the playhead stops at the end of the loop rather than coming
+        // back round to the start of it.
         if (!this.isRepeating && elapsed >= duration) {
             this.playheadTime = duration;
             this.render();
@@ -711,7 +814,23 @@ export class InertiaPlaybackController {
             return;
         }
 
-        this.playheadTime = duration > 0 ? elapsed % duration : 0;
+        const wrapped = duration > 0 ? elapsed % duration : 0;
+
+        // The timeline has come round, so whatever was triggered has had the
+        // pass it was triggered for. Held at the end of the loop, which is the
+        // frame it is on as it comes round.
+        if (wrapped < this.playheadTime) {
+            this.retireTriggeredAnimations(duration);
+
+            if (!this.isRunning) {
+                this.playheadTime = wrapped;
+                this.render();
+                this.report(false);
+                return;
+            }
+        }
+
+        this.playheadTime = wrapped;
         this.render();
         this.report(true);
 
@@ -752,18 +871,22 @@ export class InertiaPlaybackController {
         const edit = this.edits.get(hierarchyId) ?? null;
         const schema = node.schema ?? (node.isShape ? undefined : this.schemas.get(node.hierarchyIdPrefix));
 
-        const state = this.states.get(node.hierarchyIdPrefix);
-        const isTriggered = !!state?.trigger && !state.isCancelled;
+        // Scrubbing shows the animation without running it and a finished pass
+        // holds the frame it ended on, which is why one read answers both — see
+        // `trackTime`.
+        const actionableTime = this.trackTime(node.hierarchyIdPrefix);
         // A shape's own track does not share its actionable's `invokeType`: one
         // marked `auto` runs as soon as the clock does, even while the
-        // actionable it backs is still waiting on the app to trigger it. A shape
-        // given a `trigger` animation waits for that actionable, which is the
-        // only trigger a shape can be reached by.
-        const isPlayable = isTriggered
-            || (!!node.schema && node.schema.invokeType === InertiaAnimationInvokeType.auto);
-        // Scrubbing shows the animation without running it, which is why a
-        // parked playhead draws the same way a running one does.
-        const isShowingTrack = isPlayable && (this.isRunning || this.seekTime !== null);
+        // actionable it backs is still waiting on the app to trigger it, and is
+        // scrubbed with the playhead like anything else. A shape given a
+        // `trigger` animation waits for that actionable, which is the only
+        // trigger a shape can be reached by — and is held with it, since the
+        // frame the actionable is holding is the one the shape was drawn on.
+        const isShapeAuto = !!node.schema
+            && node.schema.invokeType === InertiaAnimationInvokeType.auto
+            && (this.isRunning || this.seekTime !== null);
+        const trackTime = actionableTime ?? (isShapeAuto ? this.seekTime ?? this.playheadTime : null);
+        const isShowingTrack = trackTime !== null;
 
         // A shape that appears with the animation rather than backing it — see
         // `InertiaShape.showsBeforeAnimation`. Decided ahead of the track,
@@ -791,8 +914,8 @@ export class InertiaPlaybackController {
             return;
         }
 
-        const base = isShowingTrack
-            ? valuesAtTime(schema, this.playheadTime, this.playbackDuration, this.isRepeating)
+        const base = trackTime !== null
+            ? valuesAtTime(schema, trackTime, this.playbackDuration, this.isRepeating)
             : sanitizeValues(schema.initialValues);
 
         this.write(hierarchyId, node, applyToolEdit(base, edit, this.canvasSize));
