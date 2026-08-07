@@ -519,22 +519,44 @@ export class InertiaPlaybackController {
     /// the final frame of the run they finished the first time round. The same
     /// call as the SwiftUI runtime's `InertiaDataModel.restartAll()`.
     ///
-    /// Every animation, whatever its `invokeType` and whether or not it was
-    /// cancelled — the same breadth as the editor's play button, for the same
-    /// reason `restart()` clears a cancellation: arriving on a screen is a
-    /// decision to show what is on it, and an animation held back would be one
-    /// nothing on that screen is going to start.
+    /// `invokeType` decides who plays, here as everywhere else. Arriving on a
+    /// screen is the app deciding to show what is on it — it is not the
+    /// `trigger()` call a `trigger` animation is still waiting for, and starting
+    /// one here played animations the app had said it would start itself. Those
+    /// are returned to their initial values instead, so the screen offers them
+    /// from the top when the app does trigger them. The editor's play button
+    /// does stand in for the app, which is what `isEditorPlaying` keeps true
+    /// here.
+    ///
+    /// Every schema as well as every state, since an animation that has never
+    /// run has no state to rewind and is exactly the one this has to start. A
+    /// cancellation goes with the screen that was cancelled on: the app's next
+    /// `trigger()` on this one is answered rather than dropped.
     public restartAll(): void {
         this.stopClock();
         this.playheadTime = 0;
         this.seekTime = null;
 
-        this.states.forEach(state => {
-            state.trigger = true;
-            state.isCancelled = false;
+        let didStart = false;
+
+        new Set([...this.states.keys(), ...this.schemas.keys()]).forEach(prefix => {
+            const isAuto = this.schemas.get(prefix)?.invokeType === InertiaAnimationInvokeType.auto
+                || this.isEditorPlaying;
+
+            this.states.set(prefix, { trigger: isAuto, isCancelled: false });
+            didStart = didStart || isAuto;
         });
 
         this.render();
+
+        // A screen of nothing but `trigger` animations has no run to follow, and
+        // a clock started for it would report a playhead crossing a timeline
+        // nothing is drawn from.
+        if (!didStart) {
+            this.report(false);
+            return;
+        }
+
         this.startClock();
     }
 
