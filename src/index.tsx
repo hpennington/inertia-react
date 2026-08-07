@@ -511,6 +511,33 @@ export class InertiaPlaybackController {
         this.start(id);
     }
 
+    /// Rewinds the playhead and plays every animation in this container from the
+    /// top.
+    ///
+    /// What a container reaches for when it is handed a new `hierarchyId`: the
+    /// screen just navigated to plays its animations again rather than showing
+    /// the final frame of the run they finished the first time round. The same
+    /// call as the SwiftUI runtime's `InertiaDataModel.restartAll()`.
+    ///
+    /// Every animation, whatever its `invokeType` and whether or not it was
+    /// cancelled — the same breadth as the editor's play button, for the same
+    /// reason `restart()` clears a cancellation: arriving on a screen is a
+    /// decision to show what is on it, and an animation held back would be one
+    /// nothing on that screen is going to start.
+    public restartAll(): void {
+        this.stopClock();
+        this.playheadTime = 0;
+        this.seekTime = null;
+
+        this.states.forEach(state => {
+            state.trigger = true;
+            state.isCancelled = false;
+        });
+
+        this.render();
+        this.startClock();
+    }
+
     public isCancelled(id: string): boolean {
         return this.states.get(id)?.isCancelled ?? false;
     }
@@ -794,6 +821,10 @@ export type InertiaPlaybackHandle = {
     trigger(id: string): void;
     cancel(id: string): void;
     restart(id: string): void;
+    /// Plays this container's animations from the top. What a `hierarchyId`
+    /// change does on its own, and what an app that navigates without changing
+    /// one can call itself.
+    restartAll(): void;
     isCancelled(id: string): boolean;
     /// Whether tracks repeat once they reach the end of the loop. On by
     /// default; turn it off for animations that play once.
@@ -822,6 +853,7 @@ export const useInertia = (): InertiaPlaybackHandle => {
         trigger: (id: string) => controller.trigger(id),
         cancel: (id: string) => controller.cancel(id),
         restart: (id: string) => controller.restart(id),
+        restartAll: () => controller.restartAll(),
         isCancelled: (id: string) => controller.isCancelled(id),
         get isRepeating() { return controller.isRepeating; },
         set isRepeating(value: boolean) {
@@ -1211,6 +1243,31 @@ export const InertiaContainer = ({ children, dev, id, hierarchyId, baseURL }: In
 
         });
     }, [trees, hierarchyId, dev, controller]);
+
+    /// Plays this container's animations again whenever the app hands it a new
+    /// `hierarchyId`.
+    ///
+    /// A `hierarchyId` is what the app names the screen this container is
+    /// currently showing, so a change of one is a navigation — and the screen
+    /// arrived at should play its animations rather than show the last frame of
+    /// the run they finished the first time it was up. The SwiftUI runtime
+    /// restarts on the same signal.
+    ///
+    /// Not on the first `hierarchyId` this container is given: the animations of
+    /// the screen the app opened on start themselves as their schemas arrive,
+    /// and a restart on mount would cut that run short. The effect runs on mount
+    /// all the same — React has no `onChange` — which is what the ref is for,
+    /// and it also absorbs StrictMode's second pass.
+    ///
+    /// Keyed on the controller and the id alone: this must not be re-run by an
+    /// unrelated model write, each of which would rewind a run in progress.
+    const playedHierarchyId = React.useRef(hierarchyId);
+    React.useEffect(() => {
+        if (playedHierarchyId.current === hierarchyId) return;
+
+        playedHierarchyId.current = hierarchyId;
+        controller.restartAll();
+    }, [controller, hierarchyId]);
 
     /// What the editor draws its hierarchy panel from.
     ///
