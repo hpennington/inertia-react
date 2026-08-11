@@ -36,6 +36,20 @@ module.exports = function(grunt) {
   grunt.loadNpmTasks('grunt-contrib-uglify');
   grunt.loadNpmTasks('grunt-contrib-watch');
 
+  // libinertia's wasm module and its emscripten glue, dropped into src/wasm by
+  // `make web-runtime` in the inertia-app repository. tsc leaves both alone —
+  // one is generated JavaScript and the other a binary — so the compiled output
+  // needs them copied across beside it, at the same relative path src/inertia.ts
+  // imports them by.
+  //
+  // grunt.file rather than grunt-contrib-copy: this is two files, and it is not
+  // worth a dependency.
+  grunt.registerTask('wasm', 'Copy libinertia into dist', function() {
+    grunt.file.recurse('src/wasm', function(abspath, rootdir, subdir, filename) {
+      grunt.file.copy(abspath, 'dist/wasm/' + filename);
+    });
+  });
+
   // Default tasks
-  grunt.registerTask('default', ['ts', 'uglify']);
+  grunt.registerTask('default', ['ts', 'wasm', 'uglify']);
 };

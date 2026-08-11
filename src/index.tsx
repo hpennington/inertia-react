@@ -1,6 +1,7 @@
 import React from 'react'
 import {decode} from '@msgpack/msgpack'
-import {InertiaAnimationSchema, MessageTranslation, MessageActionables, MessageActionable, InertiaSchemaWrapper, InertiaAnimationInvokeType, WebSocketClient, InertiaDataModel, inertiaTree, inertiaTreeFor, treeFor, inertiaSelection, inertiaSelectionReplacing, InertiaCanvasSize, MessageType, MessageWrapper, InertiaID, Tree, Node, ActionableIdPair, AnimationSignal, MessagePlaybackProgress, InertiaPlayback, authoredLoopDuration, valuesAtTime, sanitizeValues, InertiaShape, InertiaShapePosition, stackedShapes, Vertex, normalizedShapeTriangles, shapeBounds, hitTestShapes, shapeClipPath, inertiaFileExtension, InertiaTool, InertiaToolEdit, identityValues, noToolEdit, isNoToolEdit, addToolEdits, applyToolEdit, minimumToolScale, InertiaAnimationValues as InertiaAnimationValuesBase} from 'inertia-base'
+import {loadInertia, InertiaLibrary, InertiaRendererHandle} from './inertia'
+import {InertiaAnimationSchema, MessageTranslation, MessageActionables, MessageActionable, InertiaSchemaWrapper, InertiaAnimationInvokeType, WebSocketClient, InertiaDataModel, inertiaTree, inertiaTreeFor, treeFor, inertiaSelection, inertiaSelectionReplacing, InertiaCanvasSize, MessageType, MessageWrapper, InertiaID, Tree, Node, ActionableIdPair, AnimationSignal, MessagePlaybackProgress, InertiaPlayback, authoredLoopDuration, valuesAtTime, sanitizeValues, InertiaShape, InertiaShapePosition, stackedShapes, normalizedShapeTriangles, shapeBounds, hitTestShapes, shapeClipPath, inertiaFileExtension, InertiaTool, InertiaToolEdit, identityValues, noToolEdit, isNoToolEdit, addToolEdits, applyToolEdit, minimumToolScale, InertiaAnimationValues as InertiaAnimationValuesBase} from 'inertia-base'
 
 export type InertiaContainerProps = {
     children: React.ReactElement,
@@ -2435,68 +2436,15 @@ export function withDrag<T extends DraggableProps>(
 }
 
 // ------------------ InertiaGuts ------------------
-// ------------------ Shape canvas (WebGL) ------------------
+// ------------------ Shape canvas (libinertia) ------------------
 
-/// Positions arrive already normalized to the container the canvas fills, with
-/// a top-left origin — the same space the Metal and GLES runtimes hand their
-/// renderers — so the only work here is the flip into clip space.
-const SHAPE_VERTEX_SHADER = `
-attribute vec2 a_position;
-attribute vec4 a_color;
-varying vec4 v_color;
-
-void main() {
-    v_color = a_color;
-    gl_Position = vec4(a_position.x * 2.0 - 1.0, 1.0 - a_position.y * 2.0, 0.0, 1.0);
-}
-`;
-
-/// Colours pass through unpremultiplied; the context is created to match, and
-/// the blend function does the source-over.
-const SHAPE_FRAGMENT_SHADER = `
-precision mediump float;
-varying vec4 v_color;
-
-void main() {
-    gl_FragColor = v_color;
-}
-`;
-
-function compileShader(gl: WebGLRenderingContext, type: number, source: string): WebGLShader | null {
-    const shader = gl.createShader(type);
-    if (!shader) return null;
-
-    gl.shaderSource(shader, source);
-    gl.compileShader(shader);
-
-    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
-        console.error(`[INERTIA_LOG]: shape shader failed to compile: ${gl.getShaderInfoLog(shader)}`);
-        gl.deleteShader(shader);
-        return null;
-    }
-
-    return shader;
-}
-
-function createShapeProgram(gl: WebGLRenderingContext): WebGLProgram | null {
-    const vertex = compileShader(gl, gl.VERTEX_SHADER, SHAPE_VERTEX_SHADER);
-    const fragment = compileShader(gl, gl.FRAGMENT_SHADER, SHAPE_FRAGMENT_SHADER);
-    if (!vertex || !fragment) return null;
-
-    const program = gl.createProgram();
-    if (!program) return null;
-
-    gl.attachShader(program, vertex);
-    gl.attachShader(program, fragment);
-    gl.linkProgram(program);
-
-    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
-        console.error(`[INERTIA_LOG]: shape program failed to link: ${gl.getProgramInfoLog(program)}`);
-        return null;
-    }
-
-    return program;
-}
+/// The id a canvas is addressed by, unique on the page.
+///
+/// libinertia resolves a canvas with `document.querySelector` on the C++ side,
+/// so a CSS selector is the only handle the two sides share — which means every
+/// canvas needs a name. Not `React.useId`, whose output contains colons and is
+/// not a valid selector without escaping.
+let shapeCanvasSerial = 0;
 
 /// This node's size as laid out — the size the shapes behind it are measured
 /// against, since they are multiples of it.
@@ -2598,8 +2546,21 @@ const InertiaShapeCanvas: React.FC<{
     /// `<canvas>` has no children.
     const boxRef = useRef<HTMLDivElement>(null);
     const canvasRef = useRef<HTMLCanvasElement>(null);
-    const glRef = useRef<{ gl: WebGLRenderingContext; program: WebGLProgram; buffer: WebGLBuffer } | null>(null);
     const controller = useContext(InertiaPlaybackContext);
+
+    /// The wasm module, once it has loaded. Null on the first render of every
+    /// canvas — instantiating is a fetch and a compile, so nothing is drawn
+    /// synchronously on mount the way it was when the shaders were here.
+    const [inertia, setInertia] = useState<InertiaLibrary | null>(null);
+
+    /// This canvas' element id, fixed for its lifetime. See `shapeCanvasSerial`.
+    const canvasId = useMemo(() => `inertia-shape-canvas-${shapeCanvasSerial++}`, []);
+
+    /// libinertia's renderer for this canvas, and the wasm heap allocation it is
+    /// pointing at. Refs rather than state: nothing renders off them, and the
+    /// draw effect below has to see the current values without being re-run.
+    const rendererRef = useRef<InertiaRendererHandle | null>(null);
+    const verticesRef = useRef<{ ptr: number; count: number }>({ ptr: 0, count: 0 });
 
     // A layout effect rather than a passive one, because registering is also
     // what takes a shape that waits for the animation *off* screen: run after
@@ -2623,29 +2584,15 @@ const InertiaShapeCanvas: React.FC<{
     const bounds = useMemo(() => shapeBounds(shapes), [shapes]);
 
     /// Every shape restated in the canvas's 0..1 space and flattened into the
-    /// one triangle list the GPU draws: x, y, r, g, b, a per vertex.
+    /// one triangle list the GPU draws — the same list, in the same space, that
+    /// the Swift and Compose runtimes hand the library.
     ///
     /// Independent of the actionable's size: resizing the view resizes the
     /// canvas element without rebuilding a vertex of it.
-    const vertexData = useMemo(() => {
-        const data: number[] = [];
-        if (!bounds) return new Float32Array(data);
-
-        shapes.forEach(shape => {
-            normalizedShapeTriangles(shape, bounds).forEach((vertex: Vertex) => {
-                data.push(
-                    vertex.position.x,
-                    vertex.position.y,
-                    vertex.color.red,
-                    vertex.color.green,
-                    vertex.color.blue,
-                    vertex.color.alpha
-                );
-            });
-        });
-
-        return new Float32Array(data);
-    }, [shapes, bounds]);
+    const triangles = useMemo(
+        () => bounds ? shapes.flatMap((shape: InertiaShape) => normalizedShapeTriangles(shape, bounds)) : [],
+        [shapes, bounds]
+    );
 
     /// The length a shape's coordinates are multiples of, across and down alike:
     /// the shorter side of the actionable's box.
@@ -2681,65 +2628,84 @@ const InertiaShapeCanvas: React.FC<{
     // the longer side changes, which is a resize `unit` alone does not see.
     }, [bounds, unit, actionableSize.width, actionableSize.height]);
 
+    // Instantiating the module is a fetch and a compile, so it cannot happen on
+    // the way to the first paint. Every canvas on the page shares the one
+    // module — see `loadInertia` — so this is a fetch per page, not per canvas.
     useEffect(() => {
-        const canvas = canvasRef.current;
-        if (!canvas || !box) return;
+        let cancelled = false;
 
-        if (!glRef.current) {
-            // Unpremultiplied to match the blend function below, which is the
-            // source-over every other runtime draws with.
-            const gl = canvas.getContext("webgl", {
-                alpha: true,
-                premultipliedAlpha: false,
-                antialias: true
-            });
-            if (!gl) {
-                console.error("[INERTIA_LOG]: WebGL is unavailable; shapes will not be drawn");
-                return;
-            }
+        loadInertia().then(
+            loaded => { if (!cancelled) setInertia(loaded); },
+            error => console.error(`[INERTIA_LOG]: libinertia failed to load; shapes will not be drawn: ${error}`)
+        );
 
-            const program = createShapeProgram(gl);
-            const buffer = gl.createBuffer();
-            if (!program || !buffer) return;
+        return () => { cancelled = true; };
+    }, []);
 
-            glRef.current = { gl, program, buffer };
+    // The renderer's own lifetime, kept apart from the drawing below: it is
+    // built once for this canvas and torn down when the canvas unmounts.
+    // Browsers cap how many WebGL contexts a page may hold, so a canvas that
+    // goes away has to hand its own back — and a shape list that changes must
+    // not cost a context.
+    useEffect(() => {
+        if (!inertia || !canvasRef.current) return;
+
+        const renderer = inertia.createRenderer(`#${canvasId}`);
+        if (!renderer) {
+            console.error("[INERTIA_LOG]: WebGL2 is unavailable; shapes will not be drawn");
+            return;
         }
 
-        const { gl, program, buffer } = glRef.current;
+        rendererRef.current = renderer;
+
+        return () => {
+            rendererRef.current = null;
+            inertia.destroyRenderer(renderer);
+
+            // Only after the renderer is gone: it holds this pointer, and
+            // freeing it first would leave a live renderer reading freed heap.
+            inertia.free(verticesRef.current.ptr);
+            verticesRef.current = { ptr: 0, count: 0 };
+        };
+    }, [inertia, canvasId]);
+
+    // One frame, whenever the shapes or the canvas' box change. On demand rather
+    // than on a loop, as in the other two runtimes: the animation moves this
+    // whole element as a layer without redrawing a triangle of it.
+    useEffect(() => {
+        const canvas = canvasRef.current;
+        const renderer = rendererRef.current;
+        if (!inertia || !canvas || !renderer || !box) return;
 
         // The backing store is in device pixels; the element is sized in CSS
-        // pixels by the style below.
+        // pixels by the style below. Assigning width/height resizes the drawing
+        // buffer, and the resize call moves the library's viewport to match —
+        // doing only one of the two is the usual cause of artwork that drifts or
+        // crops as the window changes.
         const ratio = window.devicePixelRatio || 1;
         canvas.width = Math.max(1, Math.round(box.width * ratio));
         canvas.height = Math.max(1, Math.round(box.height * ratio));
+        inertia.resize(renderer, canvas.width, canvas.height);
 
-        gl.viewport(0, 0, canvas.width, canvas.height);
-        gl.clearColor(0, 0, 0, 0);
-        gl.clear(gl.COLOR_BUFFER_BIT);
+        // Reallocated only when the count changes, and handed over only then:
+        // the library re-reads this memory every frame, so a shape that merely
+        // moved is a write here and no call at all. The new pointer reaches the
+        // renderer before the old one is freed, so it never holds a stale
+        // address.
+        const held = verticesRef.current;
+        if (held.count !== triangles.length) {
+            const ptr = inertia.allocVertices(triangles.length);
+            inertia.setVertices(renderer, ptr, triangles.length);
+            inertia.free(held.ptr);
+            verticesRef.current = { ptr, count: triangles.length };
+        }
 
-        // An emptied shape list still clears, which is what takes the last
-        // frame's shapes back off the screen.
-        if (vertexData.length === 0) return;
+        inertia.writeVertices(verticesRef.current.ptr, triangles);
 
-        gl.enable(gl.BLEND);
-        gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-
-        gl.useProgram(program);
-        gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
-        gl.bufferData(gl.ARRAY_BUFFER, vertexData, gl.DYNAMIC_DRAW);
-
-        const stride = 6 * Float32Array.BYTES_PER_ELEMENT;
-
-        const positionLocation = gl.getAttribLocation(program, "a_position");
-        gl.enableVertexAttribArray(positionLocation);
-        gl.vertexAttribPointer(positionLocation, 2, gl.FLOAT, false, stride, 0);
-
-        const colorLocation = gl.getAttribLocation(program, "a_color");
-        gl.enableVertexAttribArray(colorLocation);
-        gl.vertexAttribPointer(colorLocation, 4, gl.FLOAT, false, stride, 2 * Float32Array.BYTES_PER_ELEMENT);
-
-        gl.drawArrays(gl.TRIANGLES, 0, vertexData.length / 6);
-    }, [vertexData, box]);
+        // An emptied shape list still draws: the library clears first either
+        // way, which is what takes the last frame's shapes back off the screen.
+        inertia.draw(renderer);
+    }, [inertia, triangles, box]);
 
     /// The clip that keeps a press on this canvas to the artwork, so a shape can
     /// be picked by clicking it rather than only by finding its row in the
@@ -2755,11 +2721,10 @@ const InertiaShapeCanvas: React.FC<{
     const clipPath = useMemo(() => {
         if (!onPick || !bounds || !box) return undefined;
 
-        const triangles = shapes.flatMap(shape => normalizedShapeTriangles(shape, bounds));
         const path = shapeClipPath(triangles, box.width, box.height);
 
         return path ? `path("${path}")` : undefined;
-    }, [onPick, shapes, bounds, box]);
+    }, [onPick, triangles, bounds, box]);
 
     // Shapes enclosing no area have no canvas, which is also the state in which
     // there is nothing to draw.
@@ -2800,6 +2765,7 @@ const InertiaShapeCanvas: React.FC<{
         >
             <canvas
                 ref={canvasRef}
+                id={canvasId}
                 style={{
                     position: "absolute",
                     left: 0,
