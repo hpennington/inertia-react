@@ -1,7 +1,7 @@
 import React from 'react'
 import {decode} from '@msgpack/msgpack'
 import {loadInertia, InertiaLibrary, InertiaRendererHandle} from './inertia.js'
-import {InertiaAnimationSchema, MessageTranslation, MessageActionables, MessageActionable, InertiaSchemaWrapper, InertiaAnimationInvokeType, WebSocketClient, InertiaDataModel, inertiaTree, inertiaTreeFor, treeFor, inertiaSelection, inertiaSelectionReplacing, InertiaCanvasSize, MessageType, MessageWrapper, InertiaID, Tree, Node, ActionableIdPair, AnimationSignal, MessagePlaybackProgress, InertiaPlayback, authoredLoopDuration, valuesAtTime, sanitizeValues, InertiaShape, InertiaShapePosition, stackedShapes, normalizedShapeTriangles, shapeBounds, hitTestShapes, shapeClipPath, inertiaFileExtension, InertiaTool, InertiaToolEdit, identityValues, noToolEdit, isNoToolEdit, addToolEdits, applyToolEdit, minimumToolScale, InertiaAnimationValues as InertiaAnimationValuesBase} from 'inertia-base'
+import {InertiaAnimationSchema, MessageTranslation, MessageActionables, MessageActionable, InertiaSchemaWrapper, InertiaAnimationInvokeType, WebSocketClient, InertiaDataModel, inertiaTree, inertiaTreeFor, treeFor, inertiaSelection, inertiaSelectionReplacing, InertiaCanvasSize, MessageType, MessageWrapper, InertiaID, Tree, Node, ActionableIdPair, AnimationSignal, MessagePlaybackProgress, InertiaPlayback, authoredLoopDuration, valuesAtTime, sanitizeValues, InertiaShape, InertiaShapePosition, stackedShapes, normalizedShapeTriangles, shapeBounds, hitTestShapes, shapeClipPath, inertiaFileExtension, InertiaTool, InertiaToolEdit, identityValues, defaultAnimationState, initialValues as stateInitialValues, noToolEdit, isNoToolEdit, addToolEdits, applyToolEdit, minimumToolScale, InertiaAnimationValues as InertiaAnimationValuesBase} from 'inertia-base'
 
 export type InertiaContainerProps = {
     children: React.ReactElement,
@@ -292,6 +292,16 @@ export class InertiaPlaybackController {
     /// Where the editor has parked the playhead, while it is parked there.
     /// Non-nil means the run is being scrubbed or is paused rather than played.
     public seekTime: number | null = null;
+    /// Which of each schema's state machines this container is playing.
+    ///
+    /// One name for the whole container rather than one per animation: a state
+    /// is something the screen is in — collapsed, expanded, loading — and every
+    /// actionable on it answers for that same state with whichever track it was
+    /// authored with. A schema that has nothing under the current name falls
+    /// back; see `stateMachine` in `inertia-base`.
+    ///
+    /// Moved only by `setState`, so the app owns it the way it owns `trigger`.
+    public currentState: string = defaultAnimationState;
     /// The `sequence` of the last signal applied, echoed back on every progress
     /// report so the editor can tell its own request's effect from a report
     /// still in flight from before it.
@@ -313,7 +323,28 @@ export class InertiaPlaybackController {
     /// view drawing these schemas somewhere the app is not pads its tracks to the
     /// same turn and the two playheads mean the same thing.
     get playbackDuration(): number {
-        return InertiaPlayback.duration(this.loopDuration, this.schemas.values());
+        return InertiaPlayback.duration(this.loopDuration, this.schemas.values(), this.currentState);
+    }
+
+    /// Moves this container into `state`, playing what every animation in it was
+    /// authored to do there.
+    ///
+    /// A transition, not a scrub: the tracks the actionables are drawn from all
+    /// change at once, so the playhead goes back to the top and the `auto`
+    /// animations run the new state from its start — the same thing arriving on
+    /// a screen does, and for the same reason. A `trigger` animation waits at
+    /// the new state's initial values for the app's `trigger()` call, which is
+    /// still the app's to make.
+    ///
+    /// Asking for the state it is already in does nothing at all, so a component
+    /// that says so on every render does not restart the animation under itself.
+    public setState(state: string): void {
+        if (state === this.currentState) {
+            return;
+        }
+
+        this.currentState = state;
+        this.restartAll();
     }
 
     /// Translations are stored normalized, so nothing can be drawn until the
@@ -666,6 +697,12 @@ export class InertiaPlaybackController {
             case "trigger":
                 this.trigger(signal.id);
                 break;
+            // The app's other entry point, reached the same way: what is being
+            // authored is one state of the animation, and the app under test has
+            // to be in it to show what that state does.
+            case "setState":
+                this.setState(signal.state);
+                break;
         }
     }
 
@@ -916,8 +953,8 @@ export class InertiaPlaybackController {
         }
 
         const base = trackTime !== null
-            ? valuesAtTime(schema, trackTime, this.playbackDuration, this.isRepeating)
-            : sanitizeValues(schema.initialValues);
+            ? valuesAtTime(schema, trackTime, this.playbackDuration, this.isRepeating, this.currentState)
+            : sanitizeValues(stateInitialValues(schema, this.currentState));
 
         this.write(hierarchyId, node, applyToolEdit(base, edit, this.canvasSize));
     }
@@ -971,6 +1008,14 @@ export type InertiaPlaybackHandle = {
     /// change does on its own, and what an app that navigates without changing
     /// one can call itself.
     restartAll(): void;
+    /// Puts this container into another of its authored states: every animation
+    /// in it plays that state's track from the top. See `setState` on the
+    /// SwiftUI runtime's `InertiaDataModel` and the Compose runtime's
+    /// `InertiaDataModel`, which this mirrors.
+    setState(state: string): void;
+    /// Which state the container is in — `"default"` until something says
+    /// otherwise.
+    readonly currentState: string;
     isCancelled(id: string): boolean;
     /// Whether tracks repeat once they reach the end of the loop. On by
     /// default; turn it off for animations that play once.
@@ -1000,6 +1045,8 @@ export const useInertia = (): InertiaPlaybackHandle => {
         cancel: (id: string) => controller.cancel(id),
         restart: (id: string) => controller.restart(id),
         restartAll: () => controller.restartAll(),
+        setState: (state: string) => controller.setState(state),
+        get currentState() { return controller.currentState; },
         isCancelled: (id: string) => controller.isCancelled(id),
         get isRepeating() { return controller.isRepeating; },
         set isRepeating(value: boolean) {
@@ -1060,7 +1107,7 @@ function handleMessageSchema(
             inertiaSchemas.set(schemaWrapper.animationId, schemaWrapper.schema);
 
             console.log(
-                `[INERTIA_LOG]: ✅ stored schema - animationId: ${schemaWrapper.animationId} actionableId: ${schemaWrapper.actionableId}, keyframes: ${schemaWrapper.schema.keyframes?.length ?? 0}`
+                `[INERTIA_LOG]: ✅ stored schema - animationId: ${schemaWrapper.animationId} actionableId: ${schemaWrapper.actionableId}, states: ${Object.keys(schemaWrapper.schema.states ?? {}).join(", ")}`
             );
         } else {
             console.log(`[INERTIA_LOG]: ❌ skipped - container mismatch (wanted: ${schemaWrapper.container.containerId}, have: ${inertiaDataModel.containerId})`);
@@ -1243,7 +1290,7 @@ export const InertiaContainer = ({ children, dev, id, hierarchyId, baseURL }: In
                     schemaMap.set(schema.id, schema);
                     // Map hierarchyIdPrefix to animationId
                     actionableIdToAnimationIdMap.set(schema.id, schema.id);
-                    console.log(`[INERTIA_LOG]: Loaded schema - id: ${schema.id}, keyframes: ${schema.keyframes?.length ?? 0}`);
+                    console.log(`[INERTIA_LOG]: Loaded schema - id: ${schema.id}, states: ${Object.keys(schema.states ?? {}).join(", ")}`);
                 }
 
                 console.log(`[INERTIA_LOG]: Setting inertiaDataModel with ${schemaMap.size} schemas`);
@@ -2870,7 +2917,9 @@ const InertiaShapeChrome: React.FC<{
     /// The values the shape's own track starts it at. A shape authored as
     /// backdrop has no track and so starts at the identity, which is where the
     /// editor writes the first edit on it from.
-    const initialValues = shape.animation?.initialValues;
+    const initialValues = shape.animation
+        ? stateInitialValues(shape.animation, controller?.currentState)
+        : undefined;
 
     /// Dropped once the editor has written the gesture into the shape's track
     /// and sent it back, for the reason the actionables drop theirs: by then the
@@ -3229,6 +3278,9 @@ export const Inertia: React.FC<InertiaProps> = ({ children, id }) => {
   /// file is named after.
   const hierarchyIdPrefix = id;
   const { inertiaDataModel, setInertiaDataModel } = useContext(InertiaContext)!;
+  /// The state the container is in, which is the track this node's schema is
+  /// read at — see `InertiaPlaybackController.currentState`.
+  const controller = useContext(InertiaPlaybackContext);
   const inertiaParentId = useContext(InertiaParentIdContext)!;
   const inertiaIsContainer = useContext(InertiaIsContainerContext)!;
   const inertiaContainerId = useContext(InertiaContainerIdContext);
@@ -3300,8 +3352,9 @@ export const Inertia: React.FC<InertiaProps> = ({ children, id }) => {
     if (!inertiaDataModel) return null;
 
     const animationId = inertiaDataModel.actionableIdToAnimationIdMap?.get(hierarchyIdPrefix) ?? hierarchyIdPrefix;
-    return inertiaDataModel.inertiaSchemas?.get(animationId)?.initialValues ?? null;
-  }, [inertiaDataModel, hierarchyIdPrefix]);
+    const schema = inertiaDataModel.inertiaSchemas?.get(animationId);
+    return schema ? stateInitialValues(schema, controller?.currentState) : null;
+  }, [inertiaDataModel, hierarchyIdPrefix, controller?.currentState]);
 
   /// Keyed on the values themselves rather than on the data model: any other
   /// update — a selection, say — would otherwise drop a gesture the editor has
